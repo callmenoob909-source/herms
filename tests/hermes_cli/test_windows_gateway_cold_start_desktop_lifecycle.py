@@ -184,6 +184,7 @@ def test_attested_dead_gateway_survives_desktop_ownership_and_marker_is_consumed
 
     spawned = []
     monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda: spawned.append(1) or 4242)
+    monkeypatch.setattr(gateway_windows, "_spawn_via_scheduled_task", lambda *a, **k: False)
     monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda *a, **k: [4242])
     monkeypatch.setattr(gateway_windows, "_write_start_attestation", lambda *a, **k: None)
 
@@ -227,6 +228,7 @@ def test_cold_start_is_authorized_by_the_token_generation_not_the_mutable_marker
 
     spawned = []
     monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda: spawned.append(1) or 4242)
+    monkeypatch.setattr(gateway_windows, "_spawn_via_scheduled_task", lambda *a, **k: False)
     monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda *a, **k: [4242])
     monkeypatch.setattr(gateway_windows, "_write_start_attestation", lambda *a, **k: None)
 
