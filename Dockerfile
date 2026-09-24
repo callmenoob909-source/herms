@@ -68,9 +68,17 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
+#
+# intel-media-va-driver + mesa-va-drivers are the VAAPI backends for the
+# /dev/dri devices users pass in for hardware video encode. Debian's ffmpeg
+# is already built with vaapi/qsv (and pulls libva + libvpl), but libva
+# dispatches to a per-vendor ``*_drv_video.so`` that ships in a separate
+# package; without one, ``-hwaccel vaapi`` fails at vaInitialize and every
+# encode silently falls back to software. 18 MB combined, covering Intel
+# (iHD: Gen9+ / Arc), AMD (radeonsi, r600), nouveau and virtio-gpu.
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg intel-media-va-driver mesa-va-drivers gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # Bot Screen (opt-in): PACKAGES["apt"] from tools/bot_desktop/runtime.py plus apt
