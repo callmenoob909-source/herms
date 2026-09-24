@@ -329,7 +329,10 @@ describe('useSessionStateCache — per-session turn timer', () => {
 
     expect($currentModel.get()).toBe('anthropic/claude-opus-4.8')
     expect($currentProvider.get()).toBe('anthropic')
-    expect($currentReasoningEffort.get()).toBe('high')
+    // Reasoning effort stays per-session: mirroring it into the global composer
+    // draft would seed every new chat with the last-resumed session's pin,
+    // overriding the profile default.
+    expect($currentReasoningEffort.get()).toBe('')
     expect($currentServiceTier.get()).toBe('priority')
     expect($currentFastMode.get()).toBe(true)
   })
@@ -337,7 +340,6 @@ describe('useSessionStateCache — per-session turn timer', () => {
   it('clears stale model metadata when the newly focused session has no cached value', () => {
     setCurrentModel('previous-model')
     setCurrentProvider('previous-provider')
-    setCurrentReasoningEffort('high')
     setCurrentServiceTier('priority')
     setCurrentFastMode(true)
 
@@ -362,7 +364,6 @@ describe('useSessionStateCache — per-session turn timer', () => {
 
     expect($currentModel.get()).toBe('')
     expect($currentProvider.get()).toBe('')
-    expect($currentReasoningEffort.get()).toBe('')
     expect($currentServiceTier.get()).toBe('')
     expect($currentFastMode.get()).toBe(false)
   })
