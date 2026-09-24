@@ -1285,6 +1285,7 @@ def _restore_pre_agent_primary(agent) -> Optional[bool]:
             base_url=runtime.get("base_url") or "",
             api_mode=runtime.get("api_mode") or "",
             capabilities=runtime.get("capabilities"),
+            supersede_pre_agent_primary=False,
         )
     except Exception as exc:
         logger.warning("Pre-agent primary restore failed; staying on fallback: %s", exc)
@@ -2365,12 +2366,16 @@ def _persist_switch_billing_route(agent) -> None:
 
 
 def switch_model(
-    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None
+    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None,
+    *, supersede_pre_agent_primary=True,
 ):
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
     the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
-    snapshot and re-raises (callers catch)."""
+    snapshot and re-raises (callers catch).
+
+    Explicit switches supersede a startup-fallback restore intent by default. Internal runtime
+    rebuilds that are not user choices must pass ``supersede_pre_agent_primary=False``."""
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
@@ -2425,8 +2430,9 @@ def switch_model(
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
     _finish_switch(agent, new_provider, old_norm, new_norm)
     # A successful explicit model switch supersedes any startup fallback restore intent.
-    # Otherwise the next turn can silently jump back to the originally configured primary.
-    agent._pre_agent_primary = None
+    # Internal runtime rebuilds (for example Nous wire auto-selection) must preserve it.
+    if supersede_pre_agent_primary:
+        agent._pre_agent_primary = None
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
