@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import sqlite3
 
+import pytest
+
 from hermes_cli import kanban_sql_trace as trace
 
 
@@ -32,6 +34,7 @@ def test_task_write_trace_logs_shape_stack_and_context_without_values(
     conn = _db(tmp_path)
     monkeypatch.setenv("HERMES_PROFILE", "mara")
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_context_secret")
     trace._install_connection_trace(conn, tmp_path / "trace.db")
 
     caplog.set_level(logging.WARNING, logger=trace.logger.name)
@@ -45,10 +48,46 @@ def test_task_write_trace_logs_shape_stack_and_context_without_values(
     assert "INSERT INTO tasks" in text
     assert "profile_env='mara'" in text
     assert "board_env='default'" in text
+    assert "task_env_set=True" in text
     assert "test_kanban_sql_trace.py" in text
+    assert "t_context_secret" not in text
     assert "t_deadbeef" not in text
     assert "secret title" not in text
     assert "very secret body" not in text
+    conn.close()
+
+
+def test_task_write_trace_redacts_sqlite_double_quoted_values(tmp_path, caplog):
+    conn = _db(tmp_path)
+    trace._install_connection_trace(conn, tmp_path / "trace.db")
+    caplog.set_level(logging.WARNING, logger=trace.logger.name)
+
+    conn.execute(
+        'UPDATE tasks SET title = "PRIVATE TITLE" WHERE id = "t_deadbeef"'
+    )
+
+    text = caplog.text
+    assert "[kanban-sql-trace] tasks write" in text
+    assert "UPDATE tasks" in text
+    assert "PRIVATE TITLE" not in text
+    assert "t_deadbeef" not in text
+    conn.close()
+
+
+def test_quoted_task_identifier_is_detected_before_sql_redaction(tmp_path, caplog):
+    conn = _db(tmp_path)
+    trace._install_connection_trace(conn, tmp_path / "trace.db")
+    caplog.set_level(logging.WARNING, logger=trace.logger.name)
+
+    conn.execute(
+        'UPDATE "main"."tasks" SET "title" = \'PRIVATE TITLE\' '
+        'WHERE "id" = \'t_deadbeef\''
+    )
+
+    text = caplog.text
+    assert "[kanban-sql-trace] tasks write op=UPDATE" in text
+    assert "PRIVATE TITLE" not in text
+    assert "t_deadbeef" not in text
     conn.close()
 
 
@@ -64,13 +103,56 @@ def test_trace_ignores_reads_and_other_tables(tmp_path, caplog):
     conn.close()
 
 
-def test_redaction_removes_string_blob_and_numeric_literals():
-    shaped = trace._redacted_sql_shape(
-        "UPDATE tasks SET body='don''t leak', priority=42, result=X'CAFE' "
-        "WHERE id='t_deadbeef'"
-    )
-    assert "don't leak" not in shaped
-    assert "42" not in shaped
-    assert "CAFE" not in shaped
-    assert "t_deadbeef" not in shaped
+@pytest.mark.parametrize(
+    ("statement", "secrets"),
+    [
+        (
+            "UPDATE tasks SET body='don''t leak' WHERE id='t_deadbeef'",
+            ("don''t leak", "t_deadbeef"),
+        ),
+        (
+            'UPDATE tasks SET title="PRIVATE TITLE" WHERE id="t_deadbeef"',
+            ("PRIVATE TITLE", "t_deadbeef"),
+        ),
+        (
+            'UPDATE tasks SET title="PRIVATE ""TITLE""" WHERE id=1',
+            ("PRIVATE", "TITLE"),
+        ),
+        (
+            "UPDATE tasks SET result=X'CAFE' WHERE id=1",
+            ("CAFE",),
+        ),
+        (
+            "UPDATE tasks SET priority=-42.5, score=6.02e23 WHERE id=1",
+            ("-42.5", "6.02e23"),
+        ),
+        (
+            "UPDATE tasks SET priority=0xCAFE WHERE id=1",
+            ("CAFE",),
+        ),
+        (
+            "UPDATE tasks SET priority=1 -- private line\nWHERE id=2",
+            ("private line",),
+        ),
+        (
+            "UPDATE tasks SET priority=1 /* private block */ WHERE id=2",
+            ("private block",),
+        ),
+    ],
+)
+def test_redaction_removes_private_sql_tokens(statement, secrets):
+    shaped = trace._redacted_sql_shape(statement)
+
+    for secret in secrets:
+        assert secret not in shaped
     assert shaped.startswith("UPDATE tasks SET")
+
+
+def test_runtime_context_exposes_task_presence_not_task_id(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_context_secret")
+
+    context = trace._runtime_context()
+
+    assert context["task_env_set"] is True
+    assert "task_env" not in context
+    assert "t_context_secret" not in context.values()

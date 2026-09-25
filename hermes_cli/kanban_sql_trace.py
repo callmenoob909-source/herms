@@ -39,9 +39,12 @@ _TASK_WRITE_RE = re.compile(
 )
 _BLOB_LITERAL_RE = re.compile(r"(?is)\b[xX]'(?:''|[^'])*'")
 _STRING_LITERAL_RE = re.compile(r"(?s)'(?:''|[^'])*'")
+_DOUBLE_QUOTED_TOKEN_RE = re.compile(r'(?s)"(?:""|[^"])*"')
+_HEX_NUMBER_LITERAL_RE = re.compile(r"(?i)(?<![\w.])0x[0-9a-f]+(?![\w.])")
 _NUMBER_LITERAL_RE = re.compile(
     r"(?<![\w.])-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![\w.])"
 )
+_SQL_COMMENT_RE = re.compile(r"(?s)/\*.*?\*/|--[^\r\n]*")
 _WS_RE = re.compile(r"\s+")
 
 
@@ -54,7 +57,10 @@ def _redacted_sql_shape(statement: str, *, limit: int = 1200) -> str:
     """Return statement structure without runtime literal values."""
     shaped = _BLOB_LITERAL_RE.sub("?", statement)
     shaped = _STRING_LITERAL_RE.sub("?", shaped)
+    shaped = _DOUBLE_QUOTED_TOKEN_RE.sub("?", shaped)
+    shaped = _HEX_NUMBER_LITERAL_RE.sub("?", shaped)
     shaped = _NUMBER_LITERAL_RE.sub("?", shaped)
+    shaped = _SQL_COMMENT_RE.sub("?", shaped)
     shaped = _WS_RE.sub(" ", shaped).strip()
     return shaped[:limit] + ("…" if len(shaped) > limit else "")
 
@@ -71,13 +77,13 @@ def _stack_summary() -> str:
     return " <- ".join(parts[-14:])
 
 
-def _runtime_context() -> dict[str, str]:
+def _runtime_context() -> dict[str, Any]:
     context = {
         "profile_env": os.environ.get("HERMES_PROFILE", ""),
         "home_env": os.environ.get("HERMES_HOME", ""),
         "board_env": os.environ.get("HERMES_KANBAN_BOARD", ""),
         "db_env": os.environ.get("HERMES_KANBAN_DB", ""),
-        "task_env": os.environ.get("HERMES_KANBAN_TASK", ""),
+        "task_env_set": bool(os.environ.get("HERMES_KANBAN_TASK")),
         "run_env": os.environ.get("HERMES_KANBAN_RUN_ID", ""),
         "home_override": "",
         "secret_scope_home": "",
@@ -117,7 +123,7 @@ def _install_connection_trace(conn: sqlite3.Connection, database: Any) -> None:
             logger.warning(
                 "[kanban-sql-trace] tasks write op=%s db=%s pid=%s thread=%s/%s "
                 "in_txn=%s profile_env=%r home_env=%r home_override=%r "
-                "secret_scope_home=%r board_env=%r db_env=%r task_env=%r run_env=%r "
+                "secret_scope_home=%r board_env=%r db_env=%r task_env_set=%s run_env=%r "
                 "sql=%s stack=%s",
                 _WS_RE.sub(" ", match.group("op")).upper(),
                 db_label,
@@ -131,7 +137,7 @@ def _install_connection_trace(conn: sqlite3.Connection, database: Any) -> None:
                 ctx["secret_scope_home"],
                 ctx["board_env"],
                 ctx["db_env"],
-                ctx["task_env"],
+                ctx["task_env_set"],
                 ctx["run_env"],
                 _redacted_sql_shape(statement),
                 _stack_summary(),
