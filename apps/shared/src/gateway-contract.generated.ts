@@ -4239,6 +4239,12 @@ export interface TourStep {
   side?: string | null
   [key: string]: unknown
 }
+/** ``tools/pen_canvas_tool.py`` field set: ``args`` is the editor's own MCP tool payload. */
+export interface PenToolRequestParams {
+  session_id: string
+  action: string
+  args?: Record<string, unknown>
+}
 export interface DisplayInstallSudoParams {
   session_id: string
   profile_key: string
@@ -5393,6 +5399,8 @@ export interface ServerRequestMap {
   clarify: { params: ClarifyRequestParams; result: ClarifyResult }
   /** Masked sudo password for the Bot Screen package install; app-level (empty session). */
   'display.install.sudo': { params: DisplayInstallSudoParams; result: ValueResult }
+  /** Run one pen.dev canvas operation in the desktop renderer (JSON text answer). */
+  'pen.tool': { params: PenToolRequestParams; result: ValueResult }
   /** Click / type / scroll / annotate inside the in-app browser preview. */
   'preview.act': { params: PreviewActRequestParams; result: ValueResult }
   /** Read the in-app browser preview's text (JSON text answer). */
@@ -5419,6 +5427,7 @@ export const SERVER_REQUEST_METHODS = [
   'approval',
   'clarify',
   'display.install.sudo',
+  'pen.tool',
   'preview.act',
   'preview.read',
   'secret',
