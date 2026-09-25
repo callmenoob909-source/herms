@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_cli.gui_uninstall as gui_uninstall
 import hermes_cli.uninstall as uninstall
 
 
@@ -92,3 +93,53 @@ def test_keep_data_dry_run_keeps_desktop_data_without_listing_profiles(
     assert f"Keep desktop app data: {userdata}" in output
     assert "Named profiles" not in output
     assert str(profile.path) not in output
+
+
+def test_uninstall_gui_preserves_userdata_on_keep_data(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    built = tmp_path / "desktop-dist"
+    built.mkdir()
+    userdata = tmp_path / "Hermes"
+    userdata.mkdir()
+    connections = userdata / "connections.json"
+    connections.write_text('{"id":"remote"}', encoding="utf-8")
+
+    monkeypatch.setattr(gui_uninstall, "source_built_gui_artifacts", lambda _home: [built])
+    monkeypatch.setattr(gui_uninstall, "packaged_gui_app_paths", lambda: [])
+    monkeypatch.setattr(gui_uninstall, "desktop_userdata_dir", lambda: userdata)
+
+    removed = gui_uninstall.uninstall_gui(home, remove_userdata=False)
+
+    assert not built.exists()
+    assert userdata.exists()
+    assert connections.read_text(encoding="utf-8") == '{"id":"remote"}'
+    assert userdata not in removed
+
+
+def test_keep_data_completion_reports_preserved_desktop_userdata(
+    uninstall_env, monkeypatch, capsys
+):
+    home, project_root = uninstall_env
+    userdata = home.parent / "Hermes"
+    userdata.mkdir()
+    (userdata / "connections.json").write_text('{"id":"remote"}', encoding="utf-8")
+
+    monkeypatch.setattr("hermes_cli.gui_uninstall.desktop_userdata_dir", lambda: userdata)
+    monkeypatch.setattr(
+        "hermes_cli.gui_uninstall.uninstall_gui",
+        lambda _home, *, remove_userdata=True: [Path("desktop-artifact")],
+    )
+
+    uninstall._perform_uninstall(
+        project_root=project_root,
+        hermes_home=home,
+        full_uninstall=False,
+        remove_profiles=False,
+        named_profiles=[],
+    )
+
+    output = capsys.readouterr().out
+    assert str(userdata) in output
+    assert "desktop app data" in output
+    assert (userdata / "connections.json").exists()
