@@ -1810,3 +1810,93 @@ class TestOpenVikingEnvWriter:
         assert env.read_text(encoding="utf-8").splitlines() == [
             "A=1", "OPENAI_API_KEY=new", "B=2",
         ]
+
+
+# ---------------------------------------------------------------------------
+# Write isolation — non-primary agent contexts skip every write path
+# (MemoryProvider contract: cron/flush/subagent prompts carry task instructions,
+# not durable user facts; mirrors supermemory's _write_enabled gate / #68393)
+# ---------------------------------------------------------------------------
+
+_NON_PRIMARY_CONTEXTS = ["cron", "flush", "subagent"]
+
+
+def _initialized_provider(monkeypatch, *, agent_context: str | None = None):
+    """initialize() against a healthy test-double server (no autostart, no network)."""
+    _clear_openviking_env(monkeypatch)
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://127.0.0.1:1934")
+
+    class HealthyClient:
+        """Plain test double: no ``health_payload`` attr, so ``health()`` alone decides."""
+
+        def __init__(self, endpoint, api_key="", account="", user="", agent=""):
+            assert endpoint == "http://127.0.0.1:1934"
+
+        def health(self):
+            return True
+
+        def get(self, path, **kwargs):
+            return {}
+
+        def post(self, path, payload=None, **kwargs):
+            return {}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", HealthyClient)
+    monkeypatch.setattr(
+        openviking_module,
+        "_start_local_openviking_server",
+        MagicMock(side_effect=AssertionError("healthy endpoint must not autostart")),
+    )
+
+    provider = OpenVikingMemoryProvider()
+    kwargs = {"platform": "cli"}
+    if agent_context is not None:
+        kwargs["agent_context"] = agent_context
+    provider.initialize("sid-1", **kwargs)
+    assert provider._client is not None, (
+        "test-double client should have passed the health check"
+    )
+    return provider
+
+
+@pytest.mark.parametrize("context", _NON_PRIMARY_CONTEXTS)
+def test_non_primary_contexts_skip_every_write_path(monkeypatch, context):
+    provider = _initialized_provider(monkeypatch, agent_context=context)
+
+    assert provider._write_enabled is False
+    provider._client = MagicMock()
+    ensure = MagicMock(return_value=True)
+    monkeypatch.setattr(provider, "_ensure_client", ensure)
+
+    provider.sync_turn("user text", "assistant text")
+    provider.on_session_end([{"role": "user", "content": "hi"}])
+    provider.on_session_switch("sid-2", parent_session_id="sid-1")
+    provider.on_memory_write("add", "user", "remember this")
+
+    # Nothing reached the server, and the gates returned before the shared
+    # client/connection paths were even consulted.
+    assert provider._client.mock_calls == []
+    ensure.assert_not_called()
+    # No session rotation and no worker threads either — these contexts leave no trace.
+    assert provider._session_id == "sid-1"
+    assert not provider._inflight_writers
+    assert not provider._memory_write_threads
+    assert not provider._deferred_commit_threads
+
+
+def test_primary_context_keeps_every_write_path_enabled(monkeypatch):
+    provider = _initialized_provider(monkeypatch, agent_context="primary")
+
+    assert provider._write_enabled is True
+    provider._client = MagicMock()
+    ensure = MagicMock(return_value=True)
+    monkeypatch.setattr(provider, "_ensure_client", ensure)
+
+    provider.sync_turn("user text", "assistant text")
+    provider.on_memory_write("add", "user", "remember this")
+
+    ensure.assert_called()
+    workers = [w for group in provider._inflight_writers.values() for w in group]
+    workers += list(provider._memory_write_threads)
+    for worker in workers:
+        worker.join(timeout=2.0)
