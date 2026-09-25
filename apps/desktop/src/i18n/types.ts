@@ -1008,6 +1008,7 @@ export interface Translations {
       productDesc: string
       technical: string
       technicalDesc: string
+      hide: string
       themeTitle: string
       themeDesc: string
       themeSearchPlaceholder: string
