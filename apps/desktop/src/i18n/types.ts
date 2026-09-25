@@ -3170,9 +3170,12 @@ export interface Translations {
     voiceEngineChained: string
     voiceEngineLive: string
     voiceEngineLiveNeedsKey: string
+    voiceEngineGeminiLive: string
+    voiceEngineGeminiLiveNeedsKey: string
     voiceEngineChangeFailed: string
     voiceEngineChainedShort: string
     voiceEngineLiveShort: string
+    voiceEngineGeminiLiveShort: string
     voiceDictation: string
     speakReplies: string
     stopSpeakingReplies: string
