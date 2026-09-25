@@ -1018,6 +1018,13 @@ def _build_anthropic_client_from_runtime(agent, rt: Dict[str, Any]) -> None:
     agent.client = None
 
 
+def _regate_restored_fast_overrides(agent) -> None:
+    """A switch_model snapshot keeps the pre-switch overrides (#75091), which can include a /fast
+    value the restored route rejects; re-gate so e.g. ``speed`` never reaches a local server."""
+    from agent.fast_mode import regate_pinned_fast_overrides
+    regate_pinned_fast_overrides(agent)
+
+
 def _rebuild_primary_client(agent, rt: Dict[str, Any], *, reason: str) -> None:
     """Rebuild the primary client from a ``_primary_runtime`` snapshot (MoA facade / native Anthropic / OpenAI wire)."""
     if (agent.provider or "").strip().lower() == "moa":
@@ -1068,6 +1075,7 @@ def try_recover_primary_transport(
         rt = agent._primary_runtime
         _apply_primary_runtime_fields(agent, rt)
         _rebuild_primary_client(agent, rt, reason="primary_recovery")
+        _regate_restored_fast_overrides(agent)
         wait_time = min(3 + retry_count, 8)
         agent._vprint(
             f"{agent.log_prefix}🔁 Transient {error_type} on {agent.provider} — "
@@ -1307,6 +1315,7 @@ def restore_primary_runtime(agent) -> bool:
             agent._use_prompt_caching = False
             agent._use_native_cache_layout = False
         _rebuild_primary_client(agent, rt, reason="restore_primary")
+        _regate_restored_fast_overrides(agent)
         agent.context_compressor.update_model(
             model=rt["compressor_model"], context_length=rt["compressor_context_length"],
             base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
@@ -1950,8 +1959,10 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     """Re-derive the switched-to provider's ``request_overrides`` (custom_providers ``extra_body``).
     Matches by provider key, base_url AND model (same rule as
     ``agent_init._merge_custom_provider_extra_body``) so a different model at the same endpoint
-    never inherits another's ``extra_body``. Stale ``extra_body`` cleared; ``service_tier``/``speed`` kept."""
+    never inherits another's ``extra_body``. Stale ``extra_body`` cleared; pinned ``service_tier``/``speed``
+    re-gated for the new route (``fast_mode.regate_pinned_fast_overrides``)."""
     from agent.agent_init import _custom_provider_extra_body_for_agent
+    from agent.fast_mode import regate_pinned_fast_overrides
     # Prefer the init-time cache (agent._custom_providers); reload only if absent.
     custom_providers = getattr(agent, "_custom_providers", None)
     if custom_providers is None:
@@ -1969,6 +1980,7 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     if new_extra_body:
         overrides["extra_body"] = dict(new_extra_body)
     agent.request_overrides = overrides
+    regate_pinned_fast_overrides(agent)
 
 
 # Pool reload is part of the switch and must be reversible on rollback, hence the pool fields.
