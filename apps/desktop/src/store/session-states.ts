@@ -2451,7 +2451,8 @@ export function reopenLastClosedTile(): void {
         workspaceMode: tile.workspaceMode ?? 'sessions',
         workspaceOwnerKey: tile.workspaceOwnerKey,
         workspaceTabTitle: tile.workspaceTabTitle,
-        ownerRoute: tile.ownerRoute
+        ownerRoute: tile.ownerRoute,
+        ownerProfile: tile.ownerProfile
       })
       focusOpenSession(storedSessionId)
 
