@@ -193,6 +193,101 @@ class TestExecute:
         assert "hello" in result["output"]
         assert result["returncode"] == 0
 
+    def test_cancel_cleans_staged_stdin_before_stopping(self, make_env):
+        env = make_env()
+        sandbox = env._sandbox
+        sandbox.process.exec.reset_mock()
+        started = threading.Event()
+        release = threading.Event()
+
+        def exec_side_effect(command, **kwargs):
+            if "cat > /tmp/payload.txt" in command:
+                started.set()
+                release.wait(timeout=5)
+            return _make_exec_response(result="", exit_code=0)
+
+        sandbox.process.exec.side_effect = exec_side_effect
+        handle = env._run_bash("cat > /tmp/payload.txt", stdin_data="secret")
+        assert started.wait(timeout=1)
+
+        handle.kill()
+        release.set()
+
+        assert handle.wait(timeout=2) == 0
+        sandbox.fs.delete_file.assert_called()
+        deleted_path = sandbox.fs.delete_file.call_args.args[0]
+        assert ".hermes-stdin-" in deleted_path
+        assert sandbox.fs.delete_file.call_args.kwargs["request_timeout"] == 5
+        sandbox.stop.assert_called()
+
+    def test_cancel_during_upload_removes_late_staged_file(self, make_env):
+        env = make_env()
+        sandbox = env._sandbox
+        sandbox.process.exec.reset_mock()
+        sandbox.stop.reset_mock()
+        sandbox.start.reset_mock()
+        sandbox.fs.delete_file.reset_mock()
+        upload_started = threading.Event()
+        release_upload = threading.Event()
+
+        def blocking_upload(_host_path, _remote_path):
+            upload_started.set()
+            release_upload.wait(timeout=5)
+
+        sandbox.fs.upload_file.side_effect = blocking_upload
+        # Model the first delete seeing the stopped sandbox; recovery must
+        # restart, delete the late-arriving file, then stop again.
+        sandbox.fs.delete_file.side_effect = [RuntimeError("stopped"), None]
+
+        handle = env._run_bash("cat > /tmp/payload.txt", stdin_data="secret")
+        assert upload_started.wait(timeout=1)
+
+        handle.kill()
+        release_upload.set()
+
+        assert handle.wait(timeout=2) == 130
+        assert sandbox.fs.delete_file.call_count == 2
+        deleted_paths = [call.args[0] for call in sandbox.fs.delete_file.call_args_list]
+        assert len(set(deleted_paths)) == 1
+        assert ".hermes-stdin-" in deleted_paths[0]
+        sandbox.start.assert_called_once()
+        assert sandbox.stop.call_count >= 2
+        assert not any(
+            "cat > /tmp/payload.txt" in call.args[0]
+            for call in sandbox.process.exec.call_args_list
+        )
+
+    def test_large_stdin_is_staged_outside_command_argv(self, make_env):
+        env = make_env()
+        sandbox = env._sandbox
+        sandbox.process.exec.reset_mock()
+        sandbox.process.exec.return_value = _make_exec_response(result="ok", exit_code=0)
+        uploads = []
+
+        def capture_upload(host_path, remote_path):
+            with open(host_path, "rb") as staged:
+                uploads.append((remote_path, staged.read()))
+
+        sandbox.fs.upload_file.side_effect = capture_upload
+        expected = (b"A" * (160 * 1024)) + b"\x00\xff\xfeTAIL"
+        payload = expected.decode("utf-8", "surrogateescape")
+
+        handle = env._run_bash("cat > /tmp/payload.txt", stdin_data=payload)
+
+        assert handle.wait(timeout=2) == 0
+        assert env._stdin_mode == "payload"
+        assert uploads and uploads[0][1] == expected
+        assert sandbox.fs.set_file_permissions.call_args.args[0] == uploads[0][0]
+        assert sandbox.fs.set_file_permissions.call_args.kwargs["mode"] == "600"
+        shell_cmd = next(
+            call.args[0] for call in sandbox.process.exec.call_args_list
+            if "cat > /tmp/payload.txt" in call.args[0]
+        )
+        assert payload not in shell_cmd
+        assert ".hermes-stdin-" in shell_cmd
+        assert shell_cmd.index("exec 0<") < shell_cmd.index("rm -f --")
+        assert shell_cmd.index("rm -f --") < shell_cmd.index("cat > /tmp/payload.txt")
+
 
 
 

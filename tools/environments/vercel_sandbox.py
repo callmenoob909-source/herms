@@ -14,6 +14,7 @@ import os
 import shlex
 import threading
 import time
+import uuid
 from datetime import timedelta
 from functools import cache
 from pathlib import Path
@@ -162,7 +163,7 @@ def _is_terminal(status: Any) -> bool:
 class VercelSandboxEnvironment(BaseEnvironment):
     """Vercel cloud sandbox backend."""
 
-    _stdin_mode = "heredoc"
+    _stdin_mode = "payload"
 
     def __init__(self, runtime: str | None = None, cwd: str = DEFAULT_VERCEL_CWD, timeout: int = 60,
                  cpu: float = 1, memory: int = 5120, disk: int = _DEFAULT_CONTAINER_DISK_MB,
@@ -339,17 +340,69 @@ class VercelSandboxEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120, stdin_data: str | None = None):
         """``timeout`` is enforced by the base ``_wait_for_process`` via ``cancel_fn`` (the SDK has no
-        per-exec timeout); ``stdin_data`` is already embedded as a heredoc by the base ``execute()``."""
-        del timeout, stdin_data
+        per-exec timeout). Payload stdin is staged through the SDK so it never becomes a shell argv."""
+        del timeout
         sandbox, workspace_root, lock = self._require_sandbox(), self._workspace_root, self._lock
+        cancel_requested = threading.Event()
 
         def cancel() -> None:
+            # Do not dispatch a second command here: the pinned 0.7.2 SDK has no
+            # per-command timeout, so cleanup could block the synchronous kill path.
+            # Once the staged file is opened below it is unlinked before user code;
+            # stopping the captured sandbox contains the running-command path;
+            # any raced staged file is removed by the worker after the SDK call
+            # quiesces, never from this synchronous kill callback.
+            cancel_requested.set()
             with lock:
                 self._stop_sandbox(sandbox)
 
         def exec_fn() -> tuple[str, int]:
-            return _result_parts(
-                sandbox.run_command("bash", ["-lc" if login else "-c", cmd_string], cwd=workspace_root))
+            remote_stdin = None
+            failed = False
+            try:
+                command = cmd_string
+                if stdin_data is not None:
+                    temp_dir = self.get_temp_dir().rstrip("/") or "/"
+                    remote_stdin = f"{temp_dir}/.hermes-stdin-{uuid.uuid4().hex}"
+                    _retry_vercel_call(
+                        "stdin upload",
+                        lambda: sandbox.write_files([{
+                            "path": remote_stdin,
+                            "content": stdin_data.encode("utf-8", "surrogateescape"),
+                            "mode": 0o600,
+                        }]),
+                        attempts=_WRITE_RETRY_ATTEMPTS,
+                    )
+                    if cancel_requested.is_set():
+                        return "", 130
+                    quoted_stdin = shlex.quote(remote_stdin)
+                    command = (
+                        f"exec 0< {quoted_stdin} || exit $?\n"
+                        f"rm -f -- {quoted_stdin} || exit $?\n"
+                        f"{cmd_string}"
+                    )
+                result = sandbox.run_command(
+                    "bash", ["-lc" if login else "-c", command], cwd=workspace_root)
+                return _result_parts(result)
+            except Exception:
+                failed = True
+                raise
+            finally:
+                if failed or cancel_requested.is_set():
+                    # Vercel stop() can persist filesystem state. If cancellation
+                    # raced write_files()/dispatch, wait for that SDK call to
+                    # quiesce, then use the captured sandbox to remove the staged
+                    # secret before stopping it again. This runs on the worker,
+                    # not inside kill(), so cancellation itself stays bounded.
+                    with lock:
+                        if remote_stdin:
+                            quoted_stdin = shlex.quote(remote_stdin)
+                            with contextlib.suppress(Exception):
+                                sandbox.run_command(
+                                    "bash", ["-lc", f"rm -f -- {quoted_stdin}"],
+                                    cwd=workspace_root,
+                                )
+                        self._stop_sandbox(sandbox)
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
 
     def cleanup(self):
