@@ -23,6 +23,10 @@ def uninstall_env(tmp_path, monkeypatch):
     monkeypatch.setattr(uninstall, "remove_wrapper_script", lambda: [])
     monkeypatch.setattr(uninstall, "remove_node_symlinks", lambda *_: [])
     monkeypatch.setattr(uninstall, "remove_legacy_runtime_trees", lambda *_: [])
+    monkeypatch.setattr(
+        "hermes_cli.gui_uninstall.desktop_userdata_dir",
+        lambda: tmp_path / "desktop-userdata",
+    )
     return home, project_root
 
 
@@ -115,6 +119,11 @@ def test_uninstall_gui_preserves_userdata_on_keep_data(tmp_path, monkeypatch):
     assert userdata.exists()
     assert connections.read_text(encoding="utf-8") == '{"id":"remote"}'
     assert userdata not in removed
+
+    removed = gui_uninstall.uninstall_gui(home, remove_userdata=True)
+
+    assert not userdata.exists()
+    assert userdata in removed
 
 
 def test_keep_data_completion_reports_preserved_desktop_userdata(
