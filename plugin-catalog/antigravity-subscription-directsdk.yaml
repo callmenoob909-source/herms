@@ -1,6 +1,6 @@
 name: antigravity-subscription-directsdk
 repo: https://github.com/soyelmismo/hermes-antigravity-subscription
-sha: d6c8ea5fe45da38abf2e26f30156123a1a3caab6
+sha: 3723447c12666c17ef56015a5d8b997aa7074c61
 description: >-
   Run Hermes on an Antigravity / Gemini subscription via the official agy CLI (DirectSDK path).
   Streams tokens progressively, maps thinking effort, runs from a private temp directory, and
@@ -12,7 +12,7 @@ tier: community
 category: models
 requires_hermes: ">=0.21.0"
 docs_url: https://github.com/soyelmismo/hermes-antigravity-subscription#readme
-version: "1.0.1"
+version: "1.0.2"
 readme: true
 platforms:
   - linux
