@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_constants import get_hermes_home
+from hermes_constants import assert_named_profile_home_available, get_hermes_home, profile_deletion_marker_path
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_holders import read_only_db_uri
 from hermes_state_common import (
@@ -106,10 +106,17 @@ def _claim_repair_attempt(db_path: Path) -> bool:
 def _open_lock_file(db_path: Path, suffix: str, what: str, tail: str):
     """Open ``<db>.<suffix>`` for locking; on failure warn and return None."""
     lock_path = db_path.with_name(db_path.name + suffix)
+    named_marker = profile_deletion_marker_path(db_path.parent)
+    if named_marker is not None:
+        assert_named_profile_home_available(db_path.parent)
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if named_marker is None:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
         return lock_path, lock_path.open("a+b")
     except OSError as exc:
+        if named_marker is not None:
+            raise FileNotFoundError(
+                f"Named profile home is missing or being deleted: {db_path.parent}") from exc
         logger.warning(f"Could not open state.db {what} lock %s (%s) — {tail}", lock_path, exc)
         return lock_path, None
 
@@ -196,6 +203,7 @@ def _cross_process_repair_lock(db_path: Path):
                            "surgery in this process to avoid racing the repairer. Recorded holder: %s.",
                            lock_path, _REPAIR_LOCK_TIMEOUT_SECONDS,
                            _describe_lock_holder(None if _IS_WINDOWS else _read_lock_holder_record(handle)))
+        assert_named_profile_home_available(db_path.parent)
         yield acquired
     finally:
         if acquired:
@@ -735,8 +743,10 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
     reporting (a torn page under the walk) is structural too: no FTS-only fixture does that
     while ``messages``/``sessions`` read cleanly, and the FTS rebuild ladder cannot help.
     Cannot-open / locked stays False so the caller keeps the FTS path."""
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
     try:
-        conn = sqlite3.connect(read_only_db_uri(db_path), uri=True, timeout=1.0)
+        conn = connect_tracked(read_only_db_uri(db_path), uri=True, timeout=1.0)
     except sqlite3.Error:
         return False
     try:

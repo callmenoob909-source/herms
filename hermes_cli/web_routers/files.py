@@ -25,6 +25,8 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli.profile_incarnation import profile_incarnation_lease
+from hermes_cli.web_routers.uploads import _removed_on_failure, _resolve_upload_generation
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_files import (
     _fs_path, _managed_file_entry, _managed_response_meta, _resolve_managed_path,
@@ -36,7 +38,6 @@ from hermes_cli.web_models import (
 router = APIRouter()
 
 # Late-bound so a test's monkeypatch on the owning module wins at call time.
-_profile_scope = late("_profile_scope", "hermes_cli.web_server_profiles")
 get_hermes_home = late("get_hermes_home", "hermes_cli.config")
 load_config = late("load_config", "hermes_cli.config")
 # Image types GET /api/media serves — extension-allowlisted so an authenticated
@@ -337,18 +338,46 @@ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = N
     dir ``clipboard.paste`` / ``image.attach`` use).
     """
     def _run():
-        data, mime_type, ext = _decode_chat_image_upload(payload)
-        with _profile_scope(profile) as scoped_home:
-            img_dir = Path(scoped_home or get_hermes_home()) / "images"
-            with _io_errors("Image directory is not writable", "Could not create image directory"):
-                img_dir.mkdir(parents=True, exist_ok=True)
+        from hermes_constants import named_profile_home_is_unavailable
 
-            stem = Path(_sanitize_chat_image_filename(payload.filename)).stem or "pasted-image"
-            stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-") or "pasted-image"
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            target = img_dir / f"dashboard_{ts}_{secrets.token_hex(4)}_{stem}{ext}"
-            with _io_errors("Image directory is not writable", "Could not write image"):
-                target.write_bytes(data)
+        data, mime_type, ext = _decode_chat_image_upload(payload)
+        home, expected_incarnation = _resolve_upload_generation(profile)
+
+        try:
+            with profile_incarnation_lease(
+                home,
+                expected_incarnation,
+                require_incarnation=expected_incarnation is not None,
+            ):
+                img_dir = home / "images"
+                with _io_errors("Image directory is not writable", "Could not create image directory"):
+                    try:
+                        # Never recreate a named profile parent if DELETE wins after
+                        # resolution; the lifecycle owner publishes the parent.
+                        img_dir.mkdir(parents=False, exist_ok=True)
+                    except FileNotFoundError:
+                        raise HTTPException(status_code=404, detail="Profile home is unavailable")
+                if named_profile_home_is_unavailable(home):
+                    raise HTTPException(status_code=404, detail="Profile home is unavailable")
+
+                stem = Path(_sanitize_chat_image_filename(payload.filename)).stem or "pasted-image"
+                stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-") or "pasted-image"
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                target = img_dir / f"dashboard_{ts}_{secrets.token_hex(4)}_{stem}{ext}"
+
+                with _removed_on_failure(target):
+                    with _io_errors("Image directory is not writable", "Could not write image"):
+                        target.write_bytes(data)
+                    if named_profile_home_is_unavailable(home) or not target.is_file():
+                        raise HTTPException(
+                            status_code=404,
+                            detail="Profile was deleted during upload",
+                        )
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="Profile was deleted or replaced during upload",
+            ) from exc
 
         return {
             "ok": True,
@@ -451,7 +480,10 @@ def _managed_file_response(
 
 
 @router.get("/api/files/download")
-async def download_managed_file(request: Request, path: str):
+@router.head("/api/files/download")
+async def download_managed_file(
+    request: Request, path: str, profile: Optional[str] = None, session_id: Optional[str] = None,
+):
     """Stream a managed file as an attachment download.
 
     ``auth_middleware`` also accepts the session token as ``?token=`` here so a
@@ -460,6 +492,11 @@ async def download_managed_file(request: Request, path: str):
     ``Sec-Fetch-Dest``; those are served inline for Desktop builds that still
     use this route as their player source, attachment semantics otherwise.
     """
+    # Match Desktop's session/host-OS path resolution, then retain the managed
+    # root, sensitive-file and size checks. Unscoped managed-relative paths
+    # still resolve under the configured files root, not the server cwd.
+    if session_id is not None or path.lower().startswith("file:"):
+        path = str(await _fs_download_path(path, profile, session_id))
     fetch_destination = request.headers.get("sec-fetch-dest", "").lower()
     is_media_subresource = fetch_destination in {"audio", "video"}
     return _managed_file_response(
@@ -472,11 +509,13 @@ async def download_managed_file(request: Request, path: str):
 
 @router.get("/api/files/stream")
 @router.head("/api/files/stream")
-async def stream_managed_file(request: Request, path: str):
+async def stream_managed_file(request: Request, path: str, profile: Optional[str] = None):
     """Stream managed audio/video inline with HTTP Range support — Electron's
     media pipeline may reject an attachment response as an ``<audio>``/
     ``<video>`` source. Same auth, size cap, sensitive guard and MIME detection
     as download."""
+    if path.lower().startswith("file:"):
+        path = str(await _fs_download_path(path, profile, None))
     return _managed_file_response(request, path, content_disposition_type="inline", media_only=True)
 
 

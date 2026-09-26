@@ -136,13 +136,13 @@ async def _ws_gate(ws: WebSocket, kind: str) -> Optional[tuple[str, str, str]]:
     return peer, mode, cred
 
 
-async def _close_unless_sidecar_allowed(ws: WebSocket) -> bool:
+async def _close_unless_sidecar_allowed(ws: WebSocket, *, allow_internal: bool = False) -> bool:
     """Pre-accept gates for the /api/ws, /api/pub and /api/events sidecars:
     4403 when chat is disabled or the request isn't allowed, 4401 on bad auth."""
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return False
-    if not _ws_auth_ok(ws):
+    if not _ws_auth_ok(ws, allow_internal=allow_internal):
         await ws.close(code=4401)
         return False
     if not _ws_request_is_allowed(ws):
@@ -427,11 +427,11 @@ async def console_ws(ws: WebSocket) -> None:
                 pass
 
 
-async def _pty_fail(ws: WebSocket, exc: BaseException) -> None:
+async def _pty_fail(ws: WebSocket, exc: BaseException, *, surface: str = "Chat") -> None:
     """Tell the user why chat could not start, then close 1011 so the SPA renders
     "Start new session". The raw exception goes to the server log only."""
     _log.warning("pty start failed: %s: %s", type(exc).__name__, exc)
-    await ws.send_text(f"\r\n\x1b[31m{chat_start_failure_message(exc)}\x1b[0m\r\n")
+    await ws.send_text(f"\r\n\x1b[31m{chat_start_failure_message(exc, surface=surface)}\x1b[0m\r\n")
     await ws.close(code=1011)
 
 
@@ -439,22 +439,32 @@ async def _pty_fail(ws: WebSocket, exc: BaseException) -> None:
 async def pty_ws(ws: WebSocket) -> None:
     from hermes_cli.web_server_chat import PTY_REGISTRY, PtyBridge, PtyUnavailableError, _PTY_BRIDGE_AVAILABLE, _RESIZE_RE
     from pm.package import InstallError
+    from hermes_cli import web_host_terminal
+    host_terminal = (ws.query_params.get("mode") or "").strip().lower() == "shell"
     gate = await _ws_gate(ws, "pty")
     if gate is None:
         return
     peer, mode, cred = gate
+    if host_terminal and not web_host_terminal.request_allowed():
+        await ws.close(code=4403, reason="host terminal requires authenticated Webapp")
+        return
+    persistent_shell = host_terminal and ws.query_params.get("persistent") == "1"
+    if host_terminal and not persistent_shell and ws.query_params.get("attach") is not None:
+        await ws.close(code=4403, reason="host terminal does not support reattach")
+        return
     await ws.accept()
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
     # Native Windows can't import the POSIX PTY bridge: say so and close cleanly.
     if not _PTY_BRIDGE_AVAILABLE:
-        await ws.send_text(
-            "\r\n\x1b[31mChat unavailable: the embedded terminal requires a "
-            "POSIX PTY, which native Windows Python doesn't provide.\x1b[0m\r\n"
-            "\x1b[33mInstall Hermes inside WSL2 to use the dashboard's /chat "
-            "tab — the rest of the dashboard works here.\x1b[0m\r\n"
-        )
-        await ws.close(code=1011)
+        await _pty_fail(
+            ws, PtyUnavailableError("Pseudo-terminal support is not installed on this host."),
+            surface="Terminal" if host_terminal else "Chat")
+        return
+
+    if host_terminal:
+        from hermes_cli.web_host_terminal_sessions import host_terminal as serve_host_terminal
+        await serve_host_terminal(ws, persistent=persistent_shell)
         return
 
     raw_resume = ws.query_params.get("resume") or None
@@ -571,7 +581,7 @@ async def pty_ws(ws: WebSocket) -> None:
             # Resize escape is consumed locally, never written to the PTY.
             match = _RESIZE_RE.match(raw)
             if match and match.end() == len(raw):
-                session.bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
+                session.resize(ws, cols=int(match.group(1)), rows=int(match.group(2)))
                 continue
             if not await session.write(ws, raw):
                 await _close_stalled_pty_input(ws, path="keepalive")
@@ -592,7 +602,7 @@ async def pty_ws(ws: WebSocket) -> None:
 
 @router.websocket("/api/ws")
 async def gateway_ws(ws: WebSocket) -> None:
-    if not await _close_unless_sidecar_allowed(ws):
+    if not await _close_unless_sidecar_allowed(ws, allow_internal=True):
         return
     from hermes_cli.mcp_startup import start_deferred_mcp_discovery_now
     from tui_gateway.ws import handle_ws
@@ -618,8 +628,8 @@ async def gateway_ws(ws: WebSocket) -> None:
 # child's stdio handshake with Ink.
 
 
-async def _accept_channel_ws(ws: WebSocket) -> Optional[str]:
-    if not await _close_unless_sidecar_allowed(ws):
+async def _accept_channel_ws(ws: WebSocket, *, allow_internal: bool = False) -> Optional[str]:
+    if not await _close_unless_sidecar_allowed(ws, allow_internal=allow_internal):
         return None
     channel = _channel_or_close_code(ws)
     if not channel:
@@ -631,7 +641,7 @@ async def _accept_channel_ws(ws: WebSocket) -> Optional[str]:
 
 @router.websocket("/api/pub")
 async def pub_ws(ws: WebSocket) -> None:
-    channel = await _accept_channel_ws(ws)
+    channel = await _accept_channel_ws(ws, allow_internal=True)
     if channel is None:
         return
     try:

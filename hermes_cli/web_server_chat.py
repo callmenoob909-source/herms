@@ -17,7 +17,7 @@ import urllib.request
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pathlib import Path
 from typing import Optional
-from hermes_cli.pty_session import PtySessionRegistry
+from hermes_cli.pty_session import PtySessionRegistry, WS_CLOSE_PROCESS_EXITED
 
 # Same logger the code used before extraction (record parity).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -69,10 +69,12 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
     loop = asyncio.get_running_loop()
 
     async def pump_pty_to_ws() -> None:
+        process_exited = False
         try:
             while True:
                 chunk = await loop.run_in_executor(None, bridge.read, _PTY_READ_CHUNK_TIMEOUT)
                 if chunk is None:  # EOF
+                    process_exited = True
                     return
                 if not chunk:  # no data this tick; yield control and retry
                     await asyncio.sleep(_PTY_IDLE_BACKOFF)
@@ -92,7 +94,7 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
                 # reap independent of that cancellation race (#54028).
                 await asyncio.to_thread(bridge.close)
             with contextlib.suppress(Exception):
-                await ws.close()
+                await ws.close(code=WS_CLOSE_PROCESS_EXITED if process_exited else 1000)
 
     reader_task = asyncio.create_task(pump_pty_to_ws())
 
@@ -217,7 +219,7 @@ def _gateway_ws_ticket_from_subprotocol(ws: "WebSocket") -> tuple[str, str]:
     return (ticket, "ok") if ticket else ("", "invalid")
 
 
-def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
+def _ws_auth_reason(ws: "WebSocket", *, allow_internal: bool = False) -> tuple[Optional[str], str]:
     """Validate WS-upgrade auth; return ``(reason, credential)``.
 
     ``reason`` is None when accepted, else a short token (``no_credential``,
@@ -255,6 +257,9 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
 
         internal = ws.query_params.get("internal", "")
         if internal:
+            if not allow_internal:
+                _reject("internal: endpoint not allowed")
+                return "internal_not_allowed", "internal"
             try:
                 _stamp_identity(consume_internal_credential(internal))
                 return None, "internal"
@@ -295,9 +300,9 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     return "token_mismatch", "token"
 
 
-def _ws_auth_ok(ws: "WebSocket") -> bool:
+def _ws_auth_ok(ws: "WebSocket", *, allow_internal: bool = False) -> bool:
     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
-    return _ws_auth_reason(ws)[0] is None
+    return _ws_auth_reason(ws, allow_internal=allow_internal)[0] is None
 
 
 def _resolve_chat_argv(
