@@ -2259,6 +2259,25 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
         if isinstance(api_msg, dict):
             for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
                 del api_msg[internal_key]
+    # Same whitespace strip + tool-call JSON canonicalization the main send path applies
+    # (turn_request_assembly.assemble_api_request): the summary re-sends the conversation, and
+    # stored key order in tool-call arguments would break the bit-perfect prefix local servers
+    # with prefix caching had already warmed (#123002 — a 555k-token re-prefill at 0% cached).
+    for api_msg in api_messages:
+        if isinstance(api_msg.get("content"), str):
+            api_msg["content"] = api_msg["content"].strip()
+    from agent.conversation_loop import _canonicalize_api_tool_calls
+    _canonicalize_api_tool_calls(api_messages)
+    # Same lone-surrogate strip as the main path's third pass: some Ollama-served models emit
+    # them into stored history, and with the transport transform bypassed the SDK's wire encode
+    # (ensure_ascii=False + utf-8) raises on one, burning the summary call's whole retry budget.
+    # The sanitizer is in-place; the main path runs it over a structural clone, but these rows
+    # are shallow copies whose nested dicts are still shared with the persisted transcript —
+    # clone here too so the rewrite stays copy-on-write like the passes above.
+    import copy as _copy
+    api_messages = [_copy.deepcopy(m) for m in api_messages]
+    from agent.message_sanitization import _sanitize_messages_surrogates
+    _sanitize_messages_surrogates(api_messages)
     return api_messages
 
 
