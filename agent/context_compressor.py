@@ -1382,6 +1382,21 @@ def _content_text_for_contains(content: Any) -> str:
     return "" if content is None else content if isinstance(content, str) else str(content)
 
 
+def _is_text_only_content(content: Any) -> bool:
+    """Whether the active request can be restated without losing a content part."""
+    if isinstance(content, str):
+        return True
+    return isinstance(content, list) and all(
+        isinstance(part, str)
+        or (
+            isinstance(part, dict)
+            and part.get("type") in {"text", "input_text"}
+            and isinstance(part.get("text"), str)
+        )
+        for part in content
+    )
+
+
 def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -> Any:
     """Append or prepend plain text to message content (string or multimodal list)."""
     if content is None:
@@ -4623,6 +4638,28 @@ Write only the summary body. Do not include any preamble or prefix."""
         return adjusted
 
     @classmethod
+    def _has_merged_inflight_replay(cls, message: Any) -> bool:
+        """Recognize the active request on a handoff, including after DB reload.
+
+        SessionDB and cold-history restore preserve content but not private
+        in-memory flags. The explicit replay after the summary end marker is
+        authoritative; a request quoted inside the historical summary is not.
+        """
+        if not isinstance(message, dict):
+            return False
+        if message.get(_INFLIGHT_REPLAY_MERGED_KEY):
+            return True
+        if not cls._is_context_summary_message(message):
+            return False
+        text = _content_text_for_contains(message.get("content"))
+        _, boundary, remainder = text.partition(_SUMMARY_END_MARKER)
+        return bool(
+            boundary
+            and remainder.lstrip().startswith(_INFLIGHT_TASK_REPLAY_HEADER)
+            and remainder.lstrip()[len(_INFLIGHT_TASK_REPLAY_HEADER):].strip()
+        )
+
+    @classmethod
     def _find_inflight_user_task(
         cls, messages: List[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
@@ -4665,7 +4702,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             if cls._is_actionable_user_turn(msg) and _is_real_user_message(msg):
                 last_user_idx = i
                 break
-            if isinstance(msg, dict) and msg.get(_INFLIGHT_REPLAY_MERGED_KEY):
+            if cls._has_merged_inflight_replay(msg):
                 # A previous cycle merged the live request onto this summary
                 # carrier; it is the only copy left, so it is still the task.
                 last_user_idx = i
@@ -4749,7 +4786,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
 
         last_visible_role = _last_template_visible_role(compressed)
-        if inflight.get(_INFLIGHT_REPLAY_MERGED_KEY):
+        if self._has_merged_inflight_replay(inflight):
             # Never copy a summary carrier (metadata would mark the replay
             # synthetic): restate as a plain user row.
             replay = {"role": "user", "content": task_text}
@@ -4881,6 +4918,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         if (
             allow_split_turn
             and user_anchored_cut < cut_idx
+            # The handoff can restate text, but cannot replace an audio, image,
+            # or unknown structured input with its text-only projection.
+            and _is_text_only_content(messages[last_user_idx].get("content"))
             # A single oversized user message is indivisible and must stay verbatim in the tail; this
             # exception is only for aggregate turn growth after a normally sized opening request.
             and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
