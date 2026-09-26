@@ -8,9 +8,13 @@ live there and are imported late — this module is imported BY ``plugins_cmd``)
 from __future__ import annotations
 
 import datetime
+import filecmp
 import json
 import logging
+import os
 import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -282,19 +286,42 @@ def refuse_if_installed_removed(name: str, plugin_dir) -> None:
 
 
 _PRESERVE_SKIP = ("__pycache__", CATALOG_SIDECAR)
+# What Hermes imports, runs or reads as the plugin's declaration: code and scripts (any executable file
+# too), binaries and loadable modules (a Windows .exe/.dll has no execute bit in git), manifests,
+# MCP/dependency metadata and the Desktop/skills/sidecar surfaces. Without the installed revision to
+# compare with, an old copy of any of these is the old version's, not the user's.
+_CODE_SUFFIXES = frozenset({".py", ".pyw", ".pyz", ".pyzw", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".sh",
+                            ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".bat", ".cmd", ".rb", ".pl"})
+_MODULE_SUFFIXES = frozenset({".pyc", ".pyo", ".pyd", ".node", ".wasm"})
+_REVISION_FILES = frozenset({"plugin.yaml", "plugin.yml", "plugin.json", "mcp.json", "pyproject.toml",
+                             "package.json", "package-lock.json", "uv.lock"})
+_REVISION_DIRS = frozenset({"desktop", "skills", "sidecar", "node_modules"})
 
 
-def _local_changes(target: Path) -> tuple[list[str], list[str]]:
-    """``(untracked_or_ignored, modified_tracked)`` relative paths in a git checkout; empty for a
-    non-git tree (subdir installs carry no ``.git``, so nothing can be told apart from the clone)."""
+def _revision_owned(root: Path, rel: Path) -> bool:
+    from tools.skills_guard import SUSPICIOUS_BINARY_EXTENSIONS  # what Plugin Guard flags as a binary
+    mode = (root / rel).lstat().st_mode
+    suffix = rel.suffix.lower()
+    return (suffix in _CODE_SUFFIXES or suffix in _MODULE_SUFFIXES or suffix in SUSPICIOUS_BINARY_EXTENSIONS
+            or rel.as_posix() in _REVISION_FILES or rel.parts[0] in _REVISION_DIRS
+            or (stat.S_ISREG(mode) and bool(mode & stat.S_IXUSR)))
+
+
+def _local_changes(target: Path) -> Optional[tuple[list[str], list[str]]]:
+    """``(user_files, edited_shipped_files)`` relative paths: a git checkout asks ``git status`` (a wholly
+    ignored dir is ONE entry, ``data/``); a tree without ``.git`` (subdir installs) is compared with the
+    tree its recorded revision shipped. ``None`` when neither can tell."""
     from hermes_cli.plugins_cmd import _resolve_git_executable, _run_plugin_git
     git_exe = _resolve_git_executable()
-    if not git_exe or not (target / ".git").exists():
-        return [], []
-    status = _run_plugin_git(git_exe, target, "status", "--porcelain", "--ignored", "-z", "--untracked-files=all",
-                             "--ignored=matching", timeout=30)
+    if not git_exe:
+        return None
+    if not (target / ".git").exists():
+        return _changes_against_shipped(git_exe, target)
+    # --no-optional-locks: a stat refresh of .git/index would change the tree digest taken before this.
+    status = _run_plugin_git(git_exe, target, "--no-optional-locks", "status", "--porcelain", "--ignored", "-z",
+                             "--untracked-files=all", "--ignored=matching", timeout=30)
     if status.returncode != 0:
-        return [], []
+        return None
     local, modified = [], []
     for item in status.stdout.split("\0"):
         if len(item) < 4:
@@ -306,13 +333,185 @@ def _local_changes(target: Path) -> tuple[list[str], list[str]]:
     return local, modified
 
 
+def _user_tree_files(root: Path):
+    """Relative paths of the regular files and symlinks under *root*, minus what is never the user's
+    (``.git``, bytecode, the installer's catalog record); a symlinked dir is one entry, not a tree to
+    descend. Junctions are not descended (they lead outside the tree) and FIFOs/sockets are runtime
+    endpoints, not files to carry. An unreadable directory aborts the update instead of being dropped."""
+    from hermes_cli.plugins_cmd import PluginOperationError
+    from pm.filesystem import is_junction
+
+    def unreadable(exc: OSError) -> None:
+        raise PluginOperationError(f"Could not read the installed plugin's files to keep them: {exc}") from exc
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=unreadable):
+        here = Path(dirpath)
+        links = [d for d in dirnames if (here / d).is_symlink()]
+        dirnames[:] = [d for d in dirnames if d not in links and d != ".git" and d not in _PRESERVE_SKIP
+                       and not is_junction(here / d)]
+        for name in (*filenames, *links):
+            path = here / name
+            if name == ".git" or name in _PRESERVE_SKIP or name.endswith(".pyc"):
+                continue
+            if path.is_symlink() or stat.S_ISREG(path.lstat().st_mode):
+                yield path.relative_to(root)
+
+
+def _changes_against_shipped(git_exe: str, target: Path) -> Optional[tuple[list[str], list[str]]]:
+    """:func:`_local_changes` for a tree without ``.git``. Only the recorded revision's trees are fetched
+    (``blob:none``), and the installed files are hashed with the clean filters git applied at checkout
+    (``core.autocrlf``), so an untouched file matches its blob; a symlink is hashed as git stores it (its
+    target string, unfiltered). The mode is compared as git records it (``100644``/``100755``/``120000``),
+    so a file/symlink swap or a ``chmod +x`` counts as an edit. ``None`` when that revision is
+    unreachable."""
+    from hermes_cli.plugins_cmd import _clone_timeout_seconds, _resolve_git_url, _run_plugin_git
+    record = _install_record(target) or {}
+    source, revision = str(record.get("source") or ""), str(record.get("revision") or "")
+    if not source or not revision:
+        return None
+    git_url, subdir = _resolve_git_url(source)
+    prefix = f"{subdir.strip('/')}/" if subdir else ""
+    files = list(_user_tree_files(target))
+    regular = [rel for rel in files if not (target / rel).is_symlink()]
+    links = [rel for rel in files if (target / rel).is_symlink()]
+    # Next to the plugin, so `git init` probes the execute bit on the plugin's own filesystem (core.fileMode).
+    with tempfile.TemporaryDirectory(prefix=".shipped-", dir=target.parent) as tmp:
+        try:
+            for args in (("init", "-q"), ("fetch", "-q", "--depth", "1", "--filter=blob:none", git_url, revision),
+                         ("ls-tree", "-r", "-z", "FETCH_HEAD", "--", prefix or ".")):
+                listed = _run_plugin_git(git_exe, Path(tmp), *args, auth_url=git_url if args[0] == "fetch" else "",
+                                         timeout=_clone_timeout_seconds())
+                if listed.returncode != 0:
+                    return None
+            probed = _run_plugin_git(git_exe, Path(tmp), "config", "--bool", "core.fileMode")
+            filemode = probed.stdout.strip() != "false"
+            link_blobs = Path(tmp) / ".git" / "hermes-link-targets"
+            link_blobs.mkdir()
+            for i, rel in enumerate(links):
+                (link_blobs / str(i)).write_bytes(os.fsencode(os.readlink(target / rel)))
+            hashed = [subprocess.run([git_exe, "hash-object", *flags, "--stdin-paths"], cwd=tmp, capture_output=True,
+                                     input="\n".join(paths), text=True, encoding="utf-8", errors="replace",
+                                     timeout=_clone_timeout_seconds())
+                      for flags, paths in (((), [str(target / rel) for rel in regular]),
+                                           (("--no-filters",), [str(link_blobs / str(i)) for i in range(len(links))]))]
+        except subprocess.TimeoutExpired:
+            return None
+    if any(run.returncode != 0 for run in hashed):
+        return None
+
+    def compared(mode: str) -> str:  # where the filesystem keeps no execute bit, git ignores it too
+        return "100644" if mode == "100755" and not filemode else mode
+
+    shipped = {}
+    for item in listed.stdout.split("\0"):
+        meta, _, path = item.partition("\t")
+        if path.startswith(prefix) and len(meta.split()) == 3:
+            mode, _type, sha = meta.split()
+            shipped[path[len(prefix):]] = (compared(mode), sha)
+    executable = {rel for rel in regular if (target / rel).lstat().st_mode & stat.S_IXUSR}
+    digests = {**{rel.as_posix(): (compared("100755" if rel in executable else "100644"), sha)
+                  for rel, sha in zip(regular, hashed[0].stdout.split())},
+               **{rel.as_posix(): ("120000", sha) for rel, sha in zip(links, hashed[1].stdout.split())}}
+    local, modified = [], []
+    for rel in (rel.as_posix() for rel in files):
+        if rel not in shipped:
+            local.append(rel)
+        elif digests.get(rel) != shipped[rel]:
+            modified.append(rel)
+    return local, modified
+
+
+def _same_entry(a: Path, b: Path) -> bool:
+    """Whether git would record the two entries the same: same kind, a link's own target (not what it
+    resolves to), a file's bytes and execute bit."""
+    if a.is_symlink() or b.is_symlink():
+        return a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)
+    return not (a.stat().st_mode ^ b.stat().st_mode) & stat.S_IXUSR and filecmp.cmp(a, b, shallow=False)
+
+
+def _copy_entry(src: Path, dst: Path) -> None:
+    """Copy a file, or re-create a symlink as a symlink: the user's edit to a link is where it points.
+    ``copy2(follow_symlinks=False)`` is not used because its ``copystat`` fails on macOS for a link."""
+    if src.is_symlink():
+        os.symlink(os.readlink(src), dst)
+    else:
+        shutil.copy2(src, dst)
+
+
 def _stash_local_files(target: Path, rels: list[str], stash: Path) -> None:
     for rel in rels:
         src = target / rel
-        if src.is_file():
+        if src.is_symlink() or src.is_file():
             dst = stash / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            if os.path.lexists(dst):
+                dst.unlink()
+            _copy_entry(src, dst)
+
+
+def _carry_user_files(old: Path, new: Path, local: Optional[list[str]], backup: Path) -> list[str]:
+    """Copy the user's files from the installed tree *old* into the replacement tree *new* before the swap
+    deletes *old*; return the ones copied to *backup* instead. *local* (:func:`_local_changes`) names the
+    user's files and they win over the new tree. Where the two trees disagree on file vs directory, the
+    new tree's type wins. ``None`` means the user's files cannot be told from the old version's: files
+    the new tree lacks are carried except code and plugin declarations (:func:`_revision_owned`; a
+    ``utils/`` package the new version replaced with ``utils.py`` would shadow it), and those, plus files
+    the new tree ships with other content, go to *backup*."""
+    keep = {Path(rel) for rel in local or ()}
+    set_aside: list[str] = []
+    for rel in _user_tree_files(old):
+        if local is not None and keep.isdisjoint((rel, *rel.parents)):
+            continue
+        src, dst = old / rel, new / rel
+        clash = (dst.is_dir() and not dst.is_symlink()) or any(
+            os.path.lexists(new / up) and ((new / up).is_symlink() or not (new / up).is_dir())
+            for up in list(rel.parents)[:-1])
+        if local is None and not clash and os.path.lexists(dst):
+            if not _same_entry(src, dst):
+                set_aside.append(str(rel))
+            continue
+        if clash or (local is None and _revision_owned(old, rel)):
+            set_aside.append(str(rel))
+            continue
+        for up in reversed(list(rel.parents)[:-1]):
+            if not os.path.lexists(new / up):
+                # A directory made only to hold the user's files keeps their mode (a 0700 data dir).
+                (new / up).mkdir()
+                os.chmod(new / up, stat.S_IMODE((old / up).lstat().st_mode))
+        if os.path.lexists(dst):
+            dst.unlink()
+        _copy_entry(src, dst)
+    _stash_local_files(old, set_aside, backup)
+    return set_aside
+
+
+class _UserFileCarry:
+    """What a force-replace update keeps of the installed tree *target*: edits to files the installed
+    version shipped are copied to *backup* now; calling the object with the validated replacement tree
+    carries the user's own files into it (:func:`_carry_user_files`). *digest* is the tree as classified:
+    it must be the publication baseline, or a file the live plugin writes later is deleted by the swap
+    without ever having been considered."""
+
+    def __init__(self, target: Path, backup: Path):
+        from pm.store import tree_digest
+        self.digest = tree_digest(target, modes=True)
+        changes = _local_changes(target)
+        self.local, self.modified = changes if changes is not None else (None, [])
+        self.target, self.backup, self.set_aside = target, backup, []
+        _stash_local_files(target, self.modified, backup)
+
+    def __call__(self, tree: Path) -> None:
+        self.set_aside += _carry_user_files(self.target, tree, self.local, self.backup)
+
+    def warnings(self) -> list[str]:
+        warnings = []
+        if self.modified:
+            warnings.append(f"Local edits to {len(self.modified)} tracked file(s) were not carried over; copies are "
+                            f"under {self.backup} (the previous version's files, re-apply by hand).")
+        if self.set_aside:
+            warnings.append(f"{len(self.set_aside)} of your file(s) could not be carried onto the new version's "
+                            f"files; copies are under {self.backup}.")
+        return warnings
 
 
 class RepinResult(NamedTuple):
@@ -377,8 +576,9 @@ def repin_catalog_plugin(
 ) -> RepinResult:
     """Re-pin a catalog install to the current catalog SHA (never ``git pull``).
 
-    Publication stays PM-owned and recoverable. Untracked/ignored user files are copied into the
-    staged replacement before publication; tracked edits are backed up under
+    Publication stays PM-owned and recoverable. Untracked/ignored user files (in a subdir install, files
+    the installed revision did not ship) are copied into the staged replacement before publication
+    (:class:`_UserFileCarry`); tracked edits are backed up under
     ``<HERMES_HOME>/plugins-backup/<name>-<sha8>/``. A manifest rename moves the selection and removes
     the stale directory.
 
@@ -408,7 +608,6 @@ def repin_catalog_plugin(
     if at_catalog_pin(sidecar, entry.sha):
         return RepinResult(entry.sha, False, target.name, [])
 
-    local, modified = _local_changes(target)
     old_sha8 = str(sidecar.get("sha") or "old")[:8]
     installed_surface = plugin_surface(_read_manifest(target), target)
 
@@ -427,36 +626,29 @@ def repin_catalog_plugin(
         preview_target = _resolve_subdir_within(preview_root, subdir) if subdir else preview_root
         _consent_gate(_read_manifest_for_install(preview_target), preview_target)
 
-    with tempfile.TemporaryDirectory(prefix=".repin-", dir=_plugins_dir()) as tmp:
-        stash = Path(tmp) / "local"
-        _stash_local_files(target, local, stash)
-        # Outside the plugins dir: the discovery scanners recurse into every subdirectory there.
-        backup = _plugins_dir().parent / "plugins-backup" / f"{target.name}-{old_sha8}"
-        _stash_local_files(target, modified, backup)
-        from hermes_cli.plugins_transaction import update_plugin
+    # Outside the plugins dir: the discovery scanners recurse into every subdirectory there.
+    carry = _UserFileCarry(target, _plugins_dir().parent / "plugins-backup" / f"{target.name}-{old_sha8}")
+    from hermes_cli.plugins_transaction import update_plugin
 
-        update_plugin(target, catalog_entry=entry, interactive=interactive, preserved_files=stash)
-        matches = []
-        for installed_name, row in _read_install_metadata().items():
-            if not isinstance(row, dict):
-                continue
-            block = row.get("catalog")
-            if (
-                isinstance(block, dict)
-                and block.get("name") == entry.name
-                and at_catalog_pin(block, entry.sha)
-            ):
-                matches.append(installed_name)
-        if len(matches) != 1:
-            raise PluginOperationError(
-                f"Catalog update published but its install record is ambiguous: {matches or 'missing'}."
-            )
-        installed_name = matches[0]
-        new_target = target.parent / installed_name
-    warnings: list[str] = []
-    if modified:
-        warnings.append(f"Local edits to {len(modified)} tracked file(s) were not carried over; copies are under "
-                        f"{backup} (the previous version's files, re-apply by hand).")
+    update_plugin(target, catalog_entry=entry, interactive=interactive, carry_user_files=carry)
+    matches = []
+    for installed_name, row in _read_install_metadata().items():
+        if not isinstance(row, dict):
+            continue
+        block = row.get("catalog")
+        if (
+            isinstance(block, dict)
+            and block.get("name") == entry.name
+            and at_catalog_pin(block, entry.sha)
+        ):
+            matches.append(installed_name)
+    if len(matches) != 1:
+        raise PluginOperationError(
+            f"Catalog update published but its install record is ambiguous: {matches or 'missing'}."
+        )
+    installed_name = matches[0]
+    new_target = target.parent / installed_name
+    warnings = carry.warnings()
     if new_target != target and target.exists():
         from hermes_cli.plugins_cmd import (
             _admit_and_save_plugin_sets, _get_disabled_set, _get_enabled_set, _remove_plugin_core)
@@ -471,8 +663,13 @@ def repin_catalog_plugin(
             _admit_and_save_plugin_sets(
                 enabled, disabled, action=f"Rename plugin '{target.name}' to '{installed_name}'",
                 plugin=installed_name)
-        _remove_plugin_core(target)
-        warnings.append(f"Plugin renamed itself from '{target.name}' to '{installed_name}'; the old directory was removed.")
+        if _remove_plugin_core(target, expected_digest=carry.digest):
+            warnings.append(
+                f"Plugin renamed itself from '{target.name}' to '{installed_name}'; the old directory was removed.")
+        else:
+            warnings.append(
+                f"Plugin renamed itself from '{target.name}' to '{installed_name}'; the old directory changed during "
+                f"the update and was kept at {target}. Move your files over, then `hermes plugins remove {target.name}`.")
     return RepinResult(entry.sha, True, installed_name, warnings)
 
 

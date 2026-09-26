@@ -3,6 +3,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import shutil
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hermes_cli.plugins_cmd_catalog import _UserFileCarry
 
 
 def recover_plugin_publication(project: Path, row: dict, journal: Path) -> None:
@@ -32,7 +36,9 @@ def publish_plugin(staged: Path, target: Path, old_metadata: dict, new_metadata:
     sync_venv(explicit=True, plugins=StagedUpdate({
         "staged": str(staged.resolve()), "target": str(target.absolute()),
         "old_metadata": old_metadata, "new_metadata": new_metadata,
-        "target_digest": target_digest if target_digest is not None else (tree_digest(target) if target.exists() else None),
+        "target_digest": target_digest if target_digest is not None else (
+            tree_digest(target, modes=True) if target.exists() else None),
+        "target_modes": True,
     }))
 
 
@@ -80,12 +86,15 @@ def update_plugin(
     *,
     catalog_entry=None,
     interactive: bool = False,
-    preserved_files: Path | None = None,
+    carry_user_files: _UserFileCarry | None = None,
 ) -> str:
     """Prepare a catalog re-pin or custom Git pull without changing the live tree.
 
     *interactive*: a terminal user is present to consent to newly declared dependencies;
-    the dashboard and the gateway's auto-apply pass False and get a refusal instead."""
+    the dashboard and the gateway's auto-apply pass False and get a refusal instead.
+    *carry_user_files(staged)* copies the user's files into the fresh clone before it is
+    validated and before ``*.example`` defaults are materialised, so the user's copies win;
+    the tree it classified is the one publication may replace."""
     import tempfile
 
     from hermes_cli import plugins_cmd as pc
@@ -118,7 +127,7 @@ def update_plugin(
             if feed.get("min_hermes"):
                 pc._check_manifest_version({"requires_hermes": feed["min_hermes"]}, target.name)
     refuse_if_installed_removed(target.name, target)
-    before = tree_digest(target)
+    before = carry_user_files.digest if carry_user_files is not None else tree_digest(target, modes=True)
     with tempfile.TemporaryDirectory(prefix=".update-", dir=target.parent) as directory:
         staged = Path(directory) / "plugin"
         try:
@@ -158,8 +167,8 @@ def update_plugin(
                     if not ok:
                         raise pc.PluginOperationError(output)
                 revision = pc._git_head_revision(staged, pc._resolve_git_executable())
-            if preserved_files is not None and preserved_files.exists():
-                shutil.copytree(preserved_files, staged, dirs_exist_ok=True)
+            if carry_user_files is not None:
+                carry_user_files(staged)
             manifest = pc._read_manifest_for_install(staged)
             installed_name = str(manifest.get("name") or target.name)
             if catalog_entry is None and installed_name != target.name:
@@ -175,10 +184,10 @@ def update_plugin(
             pc._scan_plugin_tree(staged, source, force=False)
             pc._copy_example_files(staged, pc._console())
             _refresh_declared_dependencies(target, staged, manifest, interactive=interactive)
-            if tree_digest(target) != before:
+            if tree_digest(target, modes=True) != before:
                 raise pc.PluginOperationError("Plugin files changed while preparing the update; retry.")
             record["revision"] = revision
-            if new_target == target and tree_digest(staged) == before:
+            if new_target == target and tree_digest(staged, modes=True) == before:
                 return output
             publish_plugin(
                 staged,
