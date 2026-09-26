@@ -131,16 +131,55 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
             interpreter = sibling
 
     from hermes_cli._launchers import resolve_store_python
-    from pm.environments import selected_venv, site_packages as dependency_site
+    from pm.environments import committed_venv, site_packages as dependency_site
 
     repo = Path(__file__).resolve().parents[1]
     managed_python = resolve_store_python(repo)
     if managed_python is not None:
         # A packaged caller may hand us the old venv launcher; select bytes
         # from the install record rather than interpreting relocated pyvenv.cfg.
-        dependencies = dependency_site(selected_venv(repo))
-
-        return str(managed_python), {"PYTHONPATH": os.pathsep.join([str(repo), str(dependencies)])}
+        #
+        # ``committed_venv``, not ``selected_venv``: with no generation recorded the
+        # latter falls back to ``base_venv`` and answers the leftover pre-PM
+        # ``<root>/venv``, which is built for whichever interpreter created it. Overlaying
+        # that on the managed store Python loads a cp311 ``pydantic_core`` on 3.14 and
+        # every script dies with ``No module named 'pydantic_core._pydantic_core'`` — the
+        # cron sibling of the gateway crash in #122183/#123650.
+        #
+        # Both "no generation" and an unreadable record (a corrupt facts.json makes
+        # ``committed_venv`` RAISE, pm/environments.py:179-193) mean this install has no
+        # tree of its own to offer. Falling through to the uv overlay below is the
+        # answer: the handed venv keeps its own interpreter and its own site-packages.
+        # Returning the bare store Python here would be WORSE than main — a store Python
+        # with nothing committed is refused by ``_require_own_dependencies`` with
+        # "hermes pm repair", and a cron script has no hermes_bootstrap to refuse it
+        # cleanly, so it runs and dies on its first third-party import. It also hands
+        # ``_windows_cron_bootstrap_argv`` an overlay with no site-packages entry, which
+        # logs a WARNING on every spawn (#123668 review).
+        #
+        # The catch is the repo's idiom for a PM read (environments_adopt.py:30,
+        # install.py:524), not bare ``Exception``: a malformed record degrades a job, but
+        # ``payload_venv``'s "payload environment escapes its root" is a fail-closed
+        # security check (pm/environments.py:92) and must not be downgraded to a warning.
+        # That one propagates, exactly as it does on the POSIX path today.
+        #
+        # The fall-through is safe because the interpreter handed to a cron script is
+        # ``sys.executable``, and on a managed install with nothing committed a booted
+        # process is by definition a venv interpreter (``_require_own_dependencies``,
+        # pm/environments.py:285-287) carrying its own packages. A stdlib venv here has
+        # no ``uv`` key, skips the overlay below, and keeps its own ``python.exe``.
+        try:
+            environment = committed_venv(repo)
+        except (OSError, RuntimeError, ValueError) as exc:
+            if "escapes its root" in str(exc):
+                raise
+            logger.warning(
+                "Windows cron script: could not read the committed dependency environment "
+                "for %s; falling back to the handed venv", repo, exc_info=True)
+            environment = None
+        if environment is not None:
+            return str(managed_python), {"PYTHONPATH": os.pathsep.join(
+                [str(repo), str(dependency_site(environment))])}
 
     cfg = _read_windows_pyvenv_cfg(venv_dir)
     home = cfg.get("home", "")
