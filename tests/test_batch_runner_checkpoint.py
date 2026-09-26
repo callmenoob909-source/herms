@@ -166,3 +166,16 @@ class TestBatchWorkerResumeBehavior:
         assert skipped_indices == [0]
 
 
+
+
+
+class TestBatchRunnerCliNormalization:
+    def test_split_csv_accepts_fire_tuple(self):
+        from batch_runner import _split_csv
+
+        assert _split_csv(("anthropic", "openai")) == ["anthropic", "openai"]
+
+    def test_split_csv_strips_and_drops_empty_values(self):
+        from batch_runner import _split_csv
+
+        assert _split_csv(" anthropic, ,openai ") == ["anthropic", "openai"]
