@@ -166,3 +166,11 @@ class TestBatchWorkerResumeBehavior:
         assert skipped_indices == [0]
 
 
+
+
+class TestBatchRunnerToolCatalog:
+    def test_bridge_tools_are_valid_trajectory_tools(self):
+        from batch_runner import ALL_POSSIBLE_TOOLS
+        from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+        assert BRIDGE_TOOL_NAMES <= ALL_POSSIBLE_TOOLS
