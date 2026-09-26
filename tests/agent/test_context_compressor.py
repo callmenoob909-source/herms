@@ -1034,6 +1034,147 @@ class TestAuthFailureAborts:
         assert c._last_summary_empty_content_failure is True
 
 
+class TestSustainedOverloadEscalation:
+    """#123167: a sustained summary-provider overload must not guarantee a session wipe.
+
+    One overload aborts so a retry can still win (#115906). But when every attempt keeps
+    aborting, the transcript only grows until the session exits compression_exhausted and
+    the gateway auto-resets — total loss, deferred. After 3 consecutive overload aborts the
+    overload stops being terminal and compress() commits the deterministic fallback instead
+    (the same bounded degrade the repeated-stall ladder takes, #112420).
+    """
+
+    def _err(self):
+        return StubProviderError(
+            "Our servers are currently overloaded. Please try again later.",
+            status_code=503,
+        )
+
+    def _compressor(self, **kwargs):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                **kwargs,
+            )
+        c.summary_model = "test/auxiliary"
+        return c
+
+    def test_first_overloads_still_abort_then_third_commits_fallback(self):
+        c = self._compressor(abort_on_summary_failure=False)
+        msgs = self._msgs(12)
+        with patch("agent.context_compressor.call_llm", side_effect=self._err()):
+            first = c.compress(msgs, current_tokens=999999, force=True)
+            second = c.compress(msgs, current_tokens=999999, force=True)
+            # First two: preserve the transcript unchanged (#115906 semantics).
+            assert first == msgs and second == msgs
+            assert c._last_compress_aborted is True
+            third = c.compress(msgs, current_tokens=999999, force=True)
+
+        # Third: sustained overload escalates — bounded fallback beats a deferred total wipe.
+        assert third != msgs
+        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is True
+        assert c._last_summary_dropped_count > 0
+        assert c._last_compression_telemetry["failure_class"] == "summary_overload_degraded"
+
+    def test_abort_on_summary_failure_true_still_hard_aborts_when_sustained(self):
+        c = self._compressor(abort_on_summary_failure=True)
+        msgs = self._msgs(12)
+        with patch("agent.context_compressor.call_llm", side_effect=self._err()):
+            for _ in range(3):
+                result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+
+    def test_successful_summary_resets_the_escalation_budget(self):
+        c = self._compressor(abort_on_summary_failure=False)
+        msgs = self._msgs(12)
+        err_then_ok = [self._err(), self._err(), "ok summary body"]
+        with patch("agent.context_compressor.call_llm", side_effect=err_then_ok):
+            c.compress(msgs, current_tokens=999999, force=True)  # 2 calls, aborts
+            c.compress(msgs, current_tokens=999999, force=True)  # 1 call, succeeds
+        assert c._consecutive_overload_aborts == 0
+        with patch("agent.context_compressor.call_llm", side_effect=self._err()):
+            fresh_abort = c.compress(msgs, current_tokens=999999, force=True)
+        # Budget was reset by the success, so this overload aborts again (not escalate).
+        assert fresh_abort == msgs
+        assert c._last_compress_aborted is True
+
+    def test_overload_budget_survives_a_fresh_compressor_bound_to_the_same_session(self, tmp_path):
+        """Review P1: the N=3 budget must be session-scoped, not object-local.
+
+        The gateway binds a fresh compressor to the existing session on every turn /
+        cache eviction, and restart/resume constructs one too. Each of those used to
+        restart the budget at zero, so a sustained outage never escalated (#123167;
+        same contract as the durable fallback streak, #100185).
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "OVERLOAD_FRESH_BIND"
+        db.create_session(session_id, source="telegram")
+        msgs = self._msgs(12)
+
+        first = self._compressor(abort_on_summary_failure=False)
+        first.bind_session_state(db, session_id)
+        with patch("agent.context_compressor.call_llm", side_effect=self._err()):
+            for _ in range(2):  # exactly two aborts — one below the escalation threshold
+                assert first.compress(msgs, current_tokens=999999, force=True) == msgs
+        assert first._consecutive_overload_aborts == 2
+        assert db.get_compression_overload_streak(session_id) == 2
+
+        # Fresh agent, same session (eviction / restart / API-server request construction).
+        second = self._compressor(abort_on_summary_failure=False)
+        second.bind_session_state(db, session_id)
+        assert second._consecutive_overload_aborts == 2  # inherited, not restarted
+        with patch("agent.context_compressor.call_llm", side_effect=self._err()):
+            third = second.compress(msgs, current_tokens=999999, force=True)
+        # Third consecutive abort IN THE SESSION escalates even though this object saw one.
+        # (A fresh object's first overload may burn the aux→main one-shot retry first, which
+        # claims telemetry failure_class=aux_model_fallback; the escalation contract is the
+        # committed fallback + settled budget, not which telemetry label won the race.)
+        assert third != msgs
+        assert second._last_summary_fallback_used is True
+        assert second._last_summary_overload_degraded is True
+        # The committed degraded fallback settles the budget so recovery gets a fresh run
+        # (the boundary caller records the completed compaction, as compress_context does).
+        second.record_completed_compaction(used_fallback=True)
+        assert db.get_compression_overload_streak(session_id) == 0
+
+    def test_overload_budget_follows_compression_rotation_to_the_child_row(self, tmp_path):
+        """A mid-outage compression rotation must not restart the budget either."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent, child = "OVERLOAD_ROT_PARENT", "OVERLOAD_ROT_CHILD"
+        db.create_session(parent, source="telegram")
+
+        compressor = self._compressor(abort_on_summary_failure=False)
+        compressor.bind_session_state(db, parent)
+        with patch("agent.context_compressor.call_llm", side_effect=self._err()):
+            for _ in range(2):
+                assert compressor.compress(self._msgs(12), current_tokens=999999, force=True) == self._msgs(12)
+        assert db.get_compression_overload_streak(parent) == 2
+
+        db.create_session(child, source="telegram", parent_session_id=parent)
+        compressor.on_session_start(
+            child, session_db=db, boundary_reason="compression", old_session_id=parent,
+        )
+        assert compressor._consecutive_overload_aborts == 2
+        assert db.get_compression_overload_streak(child) == 2
+
+    def _msgs(self, n=10):
+        return [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            for i in range(n)
+        ]
+
+
 class TestSummaryFallbackToMainModel:
     """When ``summary_model`` differs from the main model and the summary LLM
     call fails, the compressor should retry once on the main model before
