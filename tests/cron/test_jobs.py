@@ -1718,6 +1718,82 @@ class TestJobsJsonIdKeyedMap:
         assert isinstance(on_disk["jobs"], list)
         assert [j["id"] for j in on_disk["jobs"]] == ["goodjob1"]
 
+    def test_non_dict_list_entries_do_not_stop_healthy_jobs_firing(self, tmp_cron_dir):
+        """A junk entry in the canonical list shape must not abort the due scan for its
+        healthy siblings (it used to raise on every tick, so no job fired)."""
+        import json
+        from cron.jobs import JOBS_FILE
+
+        job = create_job(prompt="keep me", schedule="every 1h", name="survivor")
+        payload = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        payload["jobs"][0]["next_run_at"] = (_hermes_now() - timedelta(seconds=5)).isoformat()
+        payload["jobs"] += [None, "i am not a job", 42]
+        JOBS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert [j["id"] for j in get_due_jobs()] == [job["id"]]
+        assert [j["id"] for j in list_jobs(include_disabled=True)] == [job["id"]]
+        on_disk = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        assert [j["id"] for j in on_disk["jobs"]] == [job["id"]]
+
+    def test_all_junk_list_is_repaired_on_disk_without_logging_values(self, tmp_cron_dir, caplog):
+        """With no valid job left the repair must still persist (else every tick repeats it), and
+        the warning must not copy raw file content into the logs."""
+        import json
+        from cron.jobs import JOBS_FILE, ensure_dirs
+
+        ensure_dirs()
+        JOBS_FILE.write_text(json.dumps({"jobs": [None, "sk-leaked-value", 42]}), encoding="utf-8")
+
+        with caplog.at_level("WARNING", logger="cron.jobs"):
+            assert list_jobs(include_disabled=True) == []
+        assert json.loads(JOBS_FILE.read_text(encoding="utf-8"))["jobs"] == []
+        assert "sk-leaked-value" not in caplog.text
+
+    @pytest.mark.parametrize("bad_jobs", [None, "not-a-list", 42, True])
+    def test_invalid_jobs_field_is_repaired_to_empty_list(self, tmp_cron_dir, bad_jobs, caplog):
+        """A dict root with a scalar jobs value must not escape the load boundary."""
+        import json
+        from cron.jobs import JOBS_FILE, ensure_dirs, load_jobs
+
+        ensure_dirs()
+        JOBS_FILE.write_text(json.dumps({"jobs": bad_jobs}), encoding="utf-8")
+
+        with caplog.at_level("WARNING", logger="cron.jobs"):
+            assert load_jobs() == []
+        assert list_jobs(include_disabled=True) == []
+        assert json.loads(JOBS_FILE.read_text(encoding="utf-8"))["jobs"] == []
+        assert type(bad_jobs).__name__ in caplog.text
+
+    def test_unlocked_reader_repair_does_not_revert_a_concurrent_update(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A lock-free reader's repair must not save its stale snapshot over a writer that
+        landed after the reader parsed the file."""
+        import json
+        import cron.jobs as jobs_mod
+        from cron.jobs import JOBS_FILE, update_job
+
+        job = create_job(prompt="keep me", schedule="every 1h", name="racer")
+        payload = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        payload["jobs"].append(None)
+        JOBS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+        real_parse = jobs_mod._parse_jobs_file
+        raced = []
+
+        def parse_then_race(path):
+            parsed = real_parse(path)
+            if not raced:
+                raced.append(True)
+                update_job(job["id"], {"enabled": False})
+            return parsed
+
+        monkeypatch.setattr(jobs_mod, "_parse_jobs_file", parse_then_race)
+        list_jobs(include_disabled=True)
+
+        on_disk = json.loads(JOBS_FILE.read_text(encoding="utf-8"))["jobs"]
+        assert [j["enabled"] for j in on_disk] == [False]
+
 
 
 

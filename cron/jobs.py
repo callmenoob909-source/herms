@@ -1368,13 +1368,36 @@ def load_jobs() -> List[Dict[str, Any]]:
                     ", ".join(map(repr, skipped)))
             jobs = [{**v, "id": v.get("id") or k} for k, v in jobs.items() if isinstance(v, dict)]
             repair = "id-keyed jobs map flattened to list"
+        elif not isinstance(jobs, list):
+            logger.warning(
+                "Replacing invalid jobs.json 'jobs' field (%s) with an empty list",
+                type(jobs).__name__)
+            jobs = []
+            repair = "invalid jobs field replaced with list"
     elif isinstance(data, list):
         jobs = data
         repair = "bare list wrapped as dict"
     else:
         raise RuntimeError(
             f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}")
-    if jobs and repair:
+    if isinstance(jobs, list) and not all(isinstance(j, dict) for j in jobs):
+        # Every reader and the due scan index records as dicts: one junk entry would crash the
+        # whole tick and freeze every healthy sibling job, so skip it like the id-keyed map does.
+        # Types only: the raw values are arbitrary file content and must not reach the logs.
+        junk = [j for j in jobs if not isinstance(j, dict)]
+        logger.warning(
+            "Skipping %d non-object entr%s in jobs.json (types: %s)",
+            len(junk), "y" if len(junk) == 1 else "ies",
+            ", ".join(sorted({type(j).__name__ for j in junk})))
+        jobs = [j for j in jobs if isinstance(j, dict)]
+        repair = repair or "non-object entries dropped"
+    # Persist even an empty result, or an all-junk store repeats the repair on every tick.
+    if repair:
+        if not getattr(_jobs_lock_state, "depth", 0):
+            # An unlocked snapshot may predate a locked writer's update to a job it already holds
+            # (the shrink-merge only restores missing ids), so re-read and repair under the lock.
+            with _jobs_lock():
+                return load_jobs()
         save_jobs(jobs)
         logger.warning("Auto-repaired jobs.json (%s)", repair)
     _record_load_stamp(pre_read_stamp)
