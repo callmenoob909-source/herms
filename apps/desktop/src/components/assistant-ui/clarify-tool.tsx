@@ -497,10 +497,8 @@ function ClarifyToolSinglePending({
   )
 
   const trimmedDraft = draft.trim()
-  // The answer is whichever input is active: a picked choice, or typed text.
-  // Picking a choice no longer fires immediately — it selects, then the user
-  // confirms with Continue (or Enter from the field). Multi-select treats the
-  // typed text as one more answer alongside whatever is already picked.
+  // Multi-select stages a set, including typed text, for explicit confirmation.
+  // Single-select picks respond immediately; typed text waits for Enter/Continue.
   const multiSelectAnswers = multiSelect && trimmedDraft ? [...selectedChoices, trimmedDraft] : selectedChoices
 
   const selectedAnswer = multiSelect
@@ -513,22 +511,18 @@ function ClarifyToolSinglePending({
 
   const selectChoice = useCallback(
     (choice: string, index: number) => {
-      // Picking a choice and typing are mutually exclusive answers in
-      // single-select; multi-select keeps the typed text as one more answer.
       if (!multiSelect) {
-        setDraft('')
+        void respond(choice)
+
+        return
       }
 
-      setSelectedChoices(selected => {
-        if (!multiSelect) {
-          return [choice]
-        }
-
-        return selected.includes(choice) ? selected.filter(value => value !== choice) : [...selected, choice]
-      })
+      setSelectedChoices(selected =>
+        selected.includes(choice) ? selected.filter(value => value !== choice) : [...selected, choice]
+      )
       setActiveIndex(index)
     },
-    [multiSelect]
+    [multiSelect, respond]
   )
 
   // Keep the cursor in range when the choice set changes (never past "Other").
@@ -951,7 +945,8 @@ function BatchQuestionBlock({
 const emptyStage = { choices: [] as string[], draft: '' }
 
 /** Live batch card: all questions at once, staged locally, ONE confirm.
- * Picks and drafts stay in component state — nothing reaches the server
+ * A single single-select question instead sends its choice immediately.
+ * Other picks and drafts stay in component state — nothing reaches the server
  * until every question has a staged answer and the user presses the single
  * "Confirm and continue" button, which sends the per-question locks
  * back-to-back and completes the batch. Staged answers stay editable up to
@@ -1069,51 +1064,54 @@ function ClarifyToolBatchPending({
   const answeredCount = questions.filter(q => stagedAnswer(q) !== null).length
   const allStaged = answeredCount === questions.length
 
-  const confirmAll = useCallback(async () => {
-    if (!request || !gateway) {
-      notifyError(
-        new Error(request ? copy.gatewayDisconnected : copy.notReady),
-        copy.sendFailed,
-        request ? { action: reconnectAction() } : {}
-      )
-
-      return
-    }
-
-    setSubmitting(true)
-
-    try {
-      // Sequential, not Promise.all: the LAST lock resolves the blocked
-      // server request, so every earlier lock must already be accepted when
-      // it lands — a reordered burst could complete the batch with a missing
-      // answer. `clarify.lock` is a normal RPC; it rides the session's OWNER
-      // socket (a profile / Bot Chat switch re-points ambient elsewhere).
-      for (const question of questions) {
-        const answer = stagedAnswer(question)
-
-        await requestForOwnedSession<{ remaining?: string[]; status?: string }>(
-          request.sessionId,
-          gateway.request.bind(gateway) as typeof gateway.request,
-          'clarify.lock',
-          {
-            answer: answer ?? '',
-            question_id: question.qid,
-            request_id: request.requestId
-          }
+  const confirmAll = useCallback(
+    async (singleChoice?: string) => {
+      if (!request || !gateway) {
+        notifyError(
+          new Error(request ? copy.gatewayDisconnected : copy.notReady),
+          copy.sendFailed,
+          request ? { action: reconnectAction() } : {}
         )
+
+        return
       }
 
-      forgetServerRequest(request.requestId)
+      setSubmitting(true)
 
-      triggerHaptic('submit')
-      onAnswered()
-      // tool.complete lands next → ClarifyToolBatchSettled.
-      clearClarifyRequest(request.requestId, request.sessionId)
-    } catch (error) {
-      notifyError(error, copy.sendFailed)
-      setSubmitting(false)
-    }
-  }, [copy, gateway, onAnswered, questions, request, stagedAnswer])
+      try {
+        // Sequential, not Promise.all: the LAST lock resolves the blocked
+        // server request, so every earlier lock must already be accepted when
+        // it lands — a reordered burst could complete the batch with a missing
+        // answer. `clarify.lock` is a normal RPC; it rides the session's OWNER
+        // socket (a profile / Bot Chat switch re-points ambient elsewhere).
+        for (const question of questions) {
+          const answer = singleChoice ?? stagedAnswer(question)
+
+          await requestForOwnedSession<{ remaining?: string[]; status?: string }>(
+            request.sessionId,
+            gateway.request.bind(gateway) as typeof gateway.request,
+            'clarify.lock',
+            {
+              answer: answer ?? '',
+              question_id: question.qid,
+              request_id: request.requestId
+            }
+          )
+        }
+
+        forgetServerRequest(request.requestId)
+
+        triggerHaptic('submit')
+        onAnswered()
+        // tool.complete lands next → ClarifyToolBatchSettled.
+        clearClarifyRequest(request.requestId, request.sessionId)
+      } catch (error) {
+        notifyError(error, copy.sendFailed)
+        setSubmitting(false)
+      }
+    },
+    [copy, gateway, onAnswered, questions, request, stagedAnswer]
+  )
 
   const toggleChoice = useCallback((question: ClarifyQuestion, choice: string) => {
     setStaged(current => {
@@ -1201,7 +1199,13 @@ function ClarifyToolBatchPending({
             key={question.qid}
             locked={false}
             onDraft={value => draftFor(question, value)}
-            onToggle={choice => toggleChoice(question, choice)}
+            onToggle={choice => {
+              if (questions.length === 1 && !question.multiSelect) {
+                void confirmAll(bareChoice(choice))
+              } else {
+                toggleChoice(question, choice)
+              }
+            }}
             question={question}
             staged={stageFor(question.qid)}
           />
