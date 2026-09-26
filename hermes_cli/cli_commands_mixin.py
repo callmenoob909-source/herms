@@ -835,7 +835,11 @@ class CLICommandsMixin:
         print(f"  Snapshot created: {snap_id}" if snap_id else "  No state files found to snapshot.")
 
     def _snapshot_restore(self, parts) -> None:
-        from hermes_cli.backup import list_quick_snapshots, restore_quick_snapshot
+        from hermes_cli.backup import (
+            QuickSnapshotRestoreStatus,
+            list_quick_snapshots,
+            restore_quick_snapshot_status,
+        )
         if len(parts) < 3:
             print("  Usage: /snapshot restore <snapshot-id>")
             snaps = list_quick_snapshots(limit=1)
@@ -858,9 +862,13 @@ class CLICommandsMixin:
             with suppress(Exception):
                 local_session_db.close()
                 self._session_db = None
-        if restore_quick_snapshot(snap_id):
+        status = restore_quick_snapshot_status(snap_id)
+        if status is QuickSnapshotRestoreStatus.RESTORED:
             _pr(f"  Restored state from: {snap_id}",
                 "  Restart recommended for gateway/dashboard processes to pick up state.db changes.")
+        elif status is QuickSnapshotRestoreStatus.INCOMPLETE:
+            print(f"  Snapshot restore incomplete: {snap_id} — some files "
+                  "were not restored (see messages above).")
         else:
             print(f"  Snapshot not found: {snap_id}")
 

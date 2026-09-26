@@ -7,6 +7,7 @@ helpers used by ``hermes import`` and ``/snapshot restore``.  Backup
 which composes these helpers.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -15,14 +16,53 @@ import stat
 import sys
 import tempfile
 import zipfile
+from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from utils import (
     _preserve_file_mode, _preserve_file_owner, _restore_file_mode, _restore_file_owner, atomic_replace,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class QuickSnapshotRestoreStatus(str, Enum):
+    """Settlement of one quick-snapshot restore request."""
+
+    RESTORED = "restored"
+    NOT_FOUND = "not_found"
+    INCOMPLETE = "incomplete"
+
+
+
+# Bytes that may appear literally in a SQLite ``file:`` URI path: unreserved
+# characters plus the path separators and the Windows drive colon.  Everything
+# else — notably ``#``, ``?``, ``%``, control and non-ASCII bytes — is
+# percent-encoded by :func:`_read_only_uri`.
+_URI_PATH_SAFE_BYTES = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~" + b"/\\:"
+)
+
+
+def _read_only_uri(path: Path) -> str:
+    """Percent-encoded ``file:`` URI for a read-only SQLite connection to *path*.
+
+    SQLite's URI parser gives ``#``, ``?`` and ``%`` syntactic meaning in the
+    filename: everything from a ``#`` on is a fragment the parser drops, so an
+    unescaped ``file:{path}?mode=ro`` silently opens — and validates against —
+    whatever file sits at the pre-fragment path (a same-named decoy) instead of
+    the file the caller named (#122868).  Encoding every byte outside the
+    unreserved set, keeping only the path separators and the Windows drive
+    colon literal, makes the decoded path exact on POSIX and Windows alike.
+    """
+    raw = os.fspath(path)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "surrogateescape")
+    encoded = "".join(
+        chr(byte) if byte in _URI_PATH_SAFE_BYTES else f"%{byte:02X}" for byte in raw
+    )
+    return f"file:{encoded}?mode=ro"
 
 def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
     """PIDs of OTHER processes holding *db_path* or its WAL/SHM open.
@@ -96,7 +136,21 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     process or in-process connection holds the file: replacing the inode
     under a live holder is the #90950 split-brain, so that branch fails
     closed (returns ``False``) and the caller reports the file as skipped.
+
+    A source that does not pass ``verify_sqlite_integrity`` is refused
+    outright (#122868): both mutation routes below would otherwise publish
+    corrupt bytes over a healthy live database — ``backup()`` copies
+    malformed pages without raising, and the fallback copies the rejected
+    source verbatim.  Validated here, before the destination is opened,
+    so every caller gets the same admission decision.
     """
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    verdict = verify_sqlite_integrity(src)
+    if not verdict["valid"]:
+        logger.error("Refusing SQLite restore from %s: %s", src, verdict["message"])
+        return False
+
     dst_conn: Optional[sqlite3.Connection] = None
     try:
         dst_conn = sqlite3.connect(str(dst))
@@ -106,7 +160,7 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
             dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
             pass
-        src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        src_conn = sqlite3.connect(_read_only_uri(src), uri=True)
         try:
             src_conn.backup(dst_conn)
         finally:
@@ -270,6 +324,7 @@ def _extract_member_atomically(
     member: str,
     target: Path,
     new_file_mode: Optional[int] = None,
+    validate: Optional[Callable[[Path], None]] = None,
 ) -> None:
     """Restore one zip member onto *target* with no truncation window.
 
@@ -353,6 +408,13 @@ def _extract_member_atomically(
                 shutil.copyfileobj(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
+        if validate is not None:
+            # Policy gate against the *staged* bytes, before publish: a caller
+            # that must not install certain content (e.g. a SQLite source that
+            # fails admission, #122868) can refuse here and the target never
+            # sees the member's bytes.  A raise lands in the cleanup handler
+            # below, which unlinks the staged temp before propagating.
+            validate(Path(tmp_name))
         real_path = Path(atomic_replace(tmp_name, target))
         # Owner first, mode second — the ordering ``atomic_yaml_write`` uses,
         # because chown drops setuid/setgid and a mode restore that ran first
@@ -366,6 +428,96 @@ def _extract_member_atomically(
         except OSError:
             pass
         raise
+
+
+
+def _restore_quick_snapshot_directory(
+    snap_dir: Path,
+    home: Path,
+) -> QuickSnapshotRestoreStatus:
+    """Restore every manifest-declared member and report the aggregate honestly.
+
+    The manifest is the recovery obligation: a missing member, blocked path, refused
+    database, malformed manifest, or copy failure makes the result incomplete, but
+    valid siblings are still recovered. This is intentionally best-effort across
+    files rather than a whole-home transaction.
+    """
+    if not snap_dir.is_dir():
+        return QuickSnapshotRestoreStatus.NOT_FOUND
+
+    manifest_path = snap_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return QuickSnapshotRestoreStatus.NOT_FOUND
+
+    try:
+        with open(manifest_path, encoding="utf-8-sig") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Failed to read snapshot manifest %s: %s", manifest_path, exc)
+        return QuickSnapshotRestoreStatus.INCOMPLETE
+
+    declared = meta.get("files") if isinstance(meta, dict) else None
+    if not isinstance(declared, dict):
+        logger.error("Snapshot manifest %s has no valid files mapping", manifest_path)
+        return QuickSnapshotRestoreStatus.INCOMPLETE
+
+    try:
+        resolved_snap = snap_dir.resolve()
+        resolved_home = home.resolve()
+    except OSError as exc:
+        logger.error("Failed to resolve snapshot restore roots: %s", exc)
+        return QuickSnapshotRestoreStatus.INCOMPLETE
+
+    restored = 0
+    failures = 0
+    for rel in declared:
+        if not isinstance(rel, str) or not rel:
+            logger.error("Invalid manifest member path: %r", rel)
+            failures += 1
+            continue
+
+        src = snap_dir / rel
+        try:
+            src.resolve().relative_to(resolved_snap)
+        except (OSError, ValueError):
+            logger.error("Manifest source path traversal blocked: %s", rel)
+            failures += 1
+            continue
+
+        dst = home / rel
+        try:
+            dst.resolve().relative_to(resolved_home)
+        except (OSError, ValueError):
+            logger.error("Manifest destination path traversal blocked: %s", rel)
+            failures += 1
+            continue
+
+        if not src.exists():
+            logger.error("Snapshot member missing: %s", rel)
+            failures += 1
+            continue
+
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.suffix == ".db":
+                # Preserve the live inode so existing SQLite holders converge on
+                # the restored pages (#65942); source admission lives inside the
+                # shared restore boundary (#122868).
+                if not _safe_restore_db(src, dst):
+                    logger.error("Failed to restore %s: live-safe restore refused", rel)
+                    failures += 1
+                    continue
+            else:
+                shutil.copy2(src, dst)
+            restored += 1
+        except (OSError, PermissionError) as exc:
+            logger.error("Failed to restore %s: %s", rel, exc)
+            failures += 1
+
+    logger.info("Restored %d files from snapshot %s", restored, snap_dir.name)
+    if restored > 0 and failures == 0:
+        return QuickSnapshotRestoreStatus.RESTORED
+    return QuickSnapshotRestoreStatus.INCOMPLETE
 
 
 def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
@@ -391,6 +543,26 @@ def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
         return None
     finally:
         conn.close()
+
+
+def _validate_db_member_staging(staged: Path) -> None:
+    """Refuse to publish a staged ``.db`` member that does not verify (#122868).
+
+    The missing-target branch used to publish a fresh ``.db`` member with no
+    validation at all, so ``hermes import`` into a fresh home would install a
+    corrupt database and report success.  Raises ``OSError`` — the same
+    reporting shape the existing-target branch raises when its live-safe
+    restore is refused — so ``run_import`` records the member as skipped and
+    returns 1 instead of counting it as restored.
+    """
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    verdict = verify_sqlite_integrity(staged)
+    if not verdict["valid"]:
+        raise OSError(
+            f"refused: database member failed integrity check ({verdict['message']}); "
+            "nothing was published."
+        )
 
 
 def _import_db_member(
@@ -431,7 +603,14 @@ def _import_db_member(
                 f"{', '.join(str(pid) for pid in sorted(holders))}; publishing a new file would "
                 "leave them writing an invisible database. Stop those processes and re-run the import."
             )
-        _extract_member_atomically(zf, member, target, new_file_mode)
+        # A fresh target is still a database the user will open: the member
+        # must pass the same source admission as the existing-target branch
+        # (#122868) before anything is published.  The staged-then-publish
+        # route keeps ``_extract_member_atomically``'s new-file mode/ownership
+        # rules intact.
+        _extract_member_atomically(
+            zf, member, target, new_file_mode, validate=_validate_db_member_staging
+        )
         return
 
     # The database keeps its own mode/ownership: the bytes come from the

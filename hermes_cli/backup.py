@@ -34,6 +34,9 @@ from hermes_cli.backup_restore import (
     _detect_prefix,
     _extract_member_atomically,
     _import_db_member,
+    QuickSnapshotRestoreStatus,
+    _read_only_uri,
+    _restore_quick_snapshot_directory,
     _safe_restore_db,
     _validate_backup_zip,
 )
@@ -345,10 +348,16 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
 # --- SQLite safe copy ---
 
 def _query_ro_sqlite(path: Path, fn):
-    """Run ``fn(conn)`` on a read-only connection to *path*; return ``(value, None)`` or ``(None, exc)``."""
+    """Run ``fn(conn)`` on a read-only connection to *path*; return ``(value, None)`` or ``(None, exc)``.
+
+    The URI is percent-encoded (``_read_only_uri``) so validation and any
+    later publish agree on which file is meant: an unescaped ``file:{path}``
+    drops everything from a ``#`` and silently probes a same-named decoy
+    (#122868).
+    """
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        conn = sqlite3.connect(_read_only_uri(path), uri=True, timeout=1.0)
         return fn(conn), None
     except Exception as exc:
         return None, exc
@@ -1448,15 +1457,11 @@ def list_quick_snapshots(
     return results
 
 
-def restore_quick_snapshot(
+def restore_quick_snapshot_status(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
-) -> bool:
-    """Restore state from a quick snapshot.
-
-    Overwrites current state files with the snapshot's copies.
-    Returns True if at least one file was restored.
-    """
+) -> QuickSnapshotRestoreStatus:
+    """Restore a quick snapshot and distinguish missing from incomplete recovery."""
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
 
@@ -1464,68 +1469,27 @@ def restore_quick_snapshot(
     # traversal sequences so that `root / snapshot_id` stays inside root.
     if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id in (".", ".."):
         logger.error("Invalid snapshot_id: %s", snapshot_id)
-        return False
+        return QuickSnapshotRestoreStatus.NOT_FOUND
 
     snap_dir = root / snapshot_id
-
-    # Confirm the resolved path is still inside root (handles symlinks etc.)
     try:
         snap_dir.resolve().relative_to(root.resolve())
-    except ValueError:
+    except (OSError, ValueError):
         logger.error("Snapshot path traversal blocked for id: %s", snapshot_id)
-        return False
+        return QuickSnapshotRestoreStatus.NOT_FOUND
 
-    if not snap_dir.is_dir():
-        return False
+    return _restore_quick_snapshot_directory(snap_dir, home)
 
-    manifest_path = snap_dir / "manifest.json"
-    if not manifest_path.exists():
-        return False
 
-    with open(manifest_path, encoding="utf-8-sig") as f:
-        meta = json.load(f)
-
-    restored = 0
-    for rel in meta.get("files", {}):
-        # Security: reject absolute paths and traversals in manifest entries
-        src = snap_dir / rel
-        try:
-            src.resolve().relative_to(snap_dir.resolve())
-        except ValueError:
-            logger.error("Manifest path traversal blocked: %s", rel)
-            continue
-
-        dst = home / rel
-        try:
-            dst.resolve().relative_to(home.resolve())
-        except ValueError:
-            logger.error("Manifest path traversal blocked: %s", rel)
-            continue
-
-        if not src.exists():
-            continue
-
-        dst.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            if dst.suffix == ".db":
-                # Restore through SQLite backup API so live connections
-                # (gateway, dashboard, another CLI session) see the
-                # restored data instead of continuing to serve stale
-                # cached pages from a replaced inode (issue #65942).
-                if not _safe_restore_db(src, dst):
-                    # Refused (live holder) or failed: the destination was
-                    # left as it was. Count it as a failure, not a restore.
-                    logger.error("Failed to restore %s: live-safe restore refused", rel)
-                    continue
-            else:
-                shutil.copy2(src, dst)
-            restored += 1
-        except (OSError, PermissionError) as exc:
-            logger.error("Failed to restore %s: %s", rel, exc)
-
-    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
-    return restored > 0
+def restore_quick_snapshot(
+    snapshot_id: str,
+    hermes_home: Optional[Path] = None,
+) -> bool:
+    """Backward-compatible bool API: True only for a complete quick-snapshot restore."""
+    return (
+        restore_quick_snapshot_status(snapshot_id, hermes_home)
+        is QuickSnapshotRestoreStatus.RESTORED
+    )
 
 
 def _count_cron_jobs(path: Path) -> Optional[int]:
